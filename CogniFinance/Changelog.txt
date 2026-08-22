@@ -1,0 +1,64 @@
+Version 0.8
+
+    Fixed:
+
+        1. Handshake implemented between Android and Desktop
+        2. Fixed port for sync
+
+    Added:
+
+        1. Added logs for desktop_sync_server
+
+    To Do:
+
+        1. UI/UX fixes/polish
+
+Version 1.0
+
+    Fixed:
+
+        1. (UI/UX) Unified refresh button for tabs needing refresh + auto-refresh on tab changes
+
+    Added:
+        1. (UI/UX) Added budget, reconcilliation and recent transactions in overview tab
+
+    Status:
+        1. All major functions are stable
+
+Version 1.1
+
+    Fixed:
+
+        1. (Structural) create_encrypted_backup is now actually being called during program closing.  Tested
+
+    Added:
+
+        1. (Functional) Added audit tab and made audit trail visible and searchable.  Audit tab is a separate module
+        2. (Functional) Added actionable log and log tab as a seprate module
+
+Version 1.2
+
+    Removed:
+
+        1. (Architectural) Hard-coded tax logic moved to JSON templates
+        2. (Architectural) Tax tab placed into a separate module
+
+    Added:
+        1. (Architectural) Tax-tab now supports loading multiple templates (JSON) and exporting them to the same .xlsx file
+        2. (Feature) Tax-tab includes a "Tax Liability Estimator", currently using 2026 CRA tax code.
+
+Version 1.5
+
+        Added:
+
+        1. (Structural) Verify main database (db) is complete and flush WAL (Write Ahead Logging) before backup db encryption to prevent dropped transacntions
+        2. (Structural) Added WAL + busy timeout to the audit tab to prevent lock collison with the main program
+        3. (Functional) Sanitizes JSON template for illegal characters before exporting to .xlsx
+        4. (Architectural) Added support for OFX/QFX
+        5. (Architectural) Added the ledger logic tax from the test suite to the start of the program as QProcess.  Integrity tests run weekly
+        6. (Architectural) qtimer added to delay test start.  this ensures the program starts immediately for the user.
+        7. (UI/UX) Changed tax tab to html to be consistent with the other tabs and better presentation
+
+        Fixed:
+
+        1. (Functionsl) Fixed OS keyring failing silently and disbling on login screen

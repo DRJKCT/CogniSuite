@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "template_id": "schedule_x_sample",
+  "title": "Sample - Template",
+  "description": "Categorization of business-related deductible expenses for tax filing.",
+  "target_categories": [
+    "Software & Subscriptions",
+    "Office Supplies",
+    "Advertising",
+    "Legal & Professional Services"
+  ],
+  "aggregation_method": "sum_by_category",
+  "output_format": "itemized_summary"
+}

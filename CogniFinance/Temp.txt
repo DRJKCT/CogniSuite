@@ -1,0 +1,52 @@
+# ui_main.py to wire the dropdown for sync server unknown accounts, user to confirm account type thru dropdown
+
+import threading
+import tkinter as tk
+from tkinter import ttk
+from desktop_sync_server import CogniSyncServer, ACCOUNT_TYPES, _infer_account_type
+
+server = CogniSyncServer(gl, pairing_code)
+ctx = server.sync_context
+
+def show_unknown_account_dialog(accounts):
+    dialog = tk.Toplevel(root)
+    dialog.title("Define Unknown Accounts")
+    tk.Label(dialog, text="These accounts from your phone don't exist yet:").grid(
+        row=0, column=0, columnspan=2, padx=8, pady=8)
+    combos = {}
+    for i, name in enumerate(accounts, start=1):
+        tk.Label(dialog, text=name).grid(row=i, column=0, padx=8, pady=4, sticky="w")
+        combo = ttk.Combobox(dialog, values=ACCOUNT_TYPES, state="readonly")
+        combo.set(_infer_account_type(name))
+        combo.grid(row=i, column=1, padx=8, pady=4)
+        combos[name] = combo
+    def create_all():
+        for name, combo in combos.items():
+            ctx.create_account(name, combo.get())
+        ctx.reprocess_held()
+        dialog.destroy()
+    tk.Button(dialog, text="Create & Post", command=create_all).grid(
+        row=len(accounts) + 1, column=0, columnspan=2, pady=12)
+
+# Handler thread -> marshal onto the Tk main loop.
+ctx.on_unknown_accounts = lambda accounts: root.after(0, lambda: show_unknown_account_dialog(accounts))
+
+threading.Thread(target=server.serve_forever, daemon=True).start()
+
+# api/status implement in ui_main
+import json, urllib.request
+
+def poll_status():
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{server.server_port}/api/status",
+        data=json.dumps({"session_id": ctx.session_id}).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "X-Cogni-Sync-Token": ctx.http_token,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        status = json.loads(resp.read())
+    if status.get("unknown_accounts"):
+        show_unknown_account_dialog(status["unknown_accounts"])
