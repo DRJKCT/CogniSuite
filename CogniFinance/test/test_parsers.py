@@ -1,4 +1,9 @@
 import pytest
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from datetime import datetime
 from parser_integration import (
     _parse_cibc_full,

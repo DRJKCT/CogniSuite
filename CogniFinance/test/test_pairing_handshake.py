@@ -11,11 +11,15 @@ design, the same strategy is caught at the confirmation step because the
 attacker doesn't know the pairing code.
 """
 import os
+import sys
 import time
 import shutil
 import tempfile
 import unittest
 import uuid
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 from protocol import (
     PairingHandshake,

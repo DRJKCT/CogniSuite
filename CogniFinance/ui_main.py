@@ -13,10 +13,11 @@ from PyQt6.QtWidgets import (
     QLabel, QTextEdit, QPushButton, QFileDialog, QMessageBox,
     QGridLayout, QLineEdit, QFormLayout, QScrollArea, QSplitter,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-    QComboBox, QDateEdit, QGroupBox, QDialog, QDialogButtonBox, QSizePolicy, QAbstractItemView
+    QComboBox, QDateEdit, QGroupBox, QDialog, QDialogButtonBox, QSizePolicy, QAbstractItemView, QStyledItemDelegate
 )
-from PyQt6.QtCore import Qt, QDate, QTimer
-from PyQt6.QtGui import QColor, QFont, QPixmap, QImage
+from PyQt6.QtCore import Qt, QDate, QEvent, QTimer
+from PyQt6.QtGui import QColor, QFont, QPixmap, QImage, QDoubleValidator
+from pathlib import Path
 from datetime import datetime
 
 from ledger import GeneralLedger, Budget, ZERO
@@ -24,6 +25,8 @@ from parser_integration import parse_statement_to_transactions
 from tax_manager import TaxTemplateManager
 from pdf_import import PDFImportThread
 from decimal import Decimal
+from notification_center import NotificationCenter, NotificationStore, Severity
+from notification_widgets import NotificationBell
 
 from desktop_sync_server import CogniSyncServer
 from protocol import make_pairing_code
@@ -31,7 +34,7 @@ from log_tab import LogTab
 from audit_tab import AuditTab
 from tax_tab import TaxTab
 from ofx_import import parse_ofx_to_ledger_transactions
-from integrity_checker import IntegrityChecker, should_run_integrity_check, save_cooldown_timestamp
+from TestRunnerManager import TestRunnerManager
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -46,10 +49,11 @@ class BudgetApp(QMainWindow):
         self.gl = GeneralLedger(db_path, passphrase)
         self._tx_table_id_map = {}
         self.rule_edit_id = None
+        self.db_dir = os.path.dirname(self.gl.db_path)
+        store_path = Path(self.db_dir) / "notifications.json"
+        self.notifications = NotificationCenter(NotificationStore(store_path))
 
-        # Mobile sync state. The sync server is deliberately ephemeral: it is
-        # created when the user starts pairing/sync and stopped when the phone
-        # sends /api/shutdown or the user stops it from the UI.
+        # Mobile sync state.
         self.sync_server = None
         self.sync_thread = None
         self.sync_status_timer = None
@@ -66,13 +70,13 @@ class BudgetApp(QMainWindow):
         root.addWidget(self.tabs)
 
         self.tab_overview = QWidget()
-        self.tab_accounts = QWidget()
+        self.tab_reconcile = QWidget()
         self.tab_transactions = QWidget()
         self.tab_transactions2 = QWidget()
         self.tab_budgets = QWidget()
         self.tab_charts = QWidget()
         self.tab_reports = QWidget()
-        self.tab_reconcile = QWidget()
+        self.tab_accounts = QWidget()
         self.tab_balance = QWidget()
         self.tab_rules = QWidget()
         self.tab_taxes = TaxTab(self.gl)
@@ -81,13 +85,13 @@ class BudgetApp(QMainWindow):
         self.tab_audit = AuditTab(db_path=self.gl.db_path, passphrase=self.gl.passphrase)
 
         self.tabs.addTab(self.tab_overview, "Overview")
-        self.tabs.addTab(self.tab_accounts, "Accounts")
+        self.tabs.addTab(self.tab_reconcile, "Reconciliation")
         self.tabs.addTab(self.tab_transactions, "Transactions")
         self.tabs.addTab(self.tab_transactions2, "Add/Edit")
         self.tabs.addTab(self.tab_budgets, "Budgets")
         self.tabs.addTab(self.tab_charts, "Charts")
         self.tabs.addTab(self.tab_reports, "Reports")
-        self.tabs.addTab(self.tab_reconcile, "Reconciliation")
+        self.tabs.addTab(self.tab_accounts, "Accounts")
         self.tabs.addTab(self.tab_balance, "Balance Sheet")
         self.tabs.addTab(self.tab_rules, "Category Rules")
         self.tabs.addTab(self.tab_taxes, "Taxes")
@@ -96,86 +100,107 @@ class BudgetApp(QMainWindow):
         self.tabs.addTab(self.tab_audit, "Audit Log")
 
         self._init_overview()
-        self._init_accounts()
+        self._init_reconcile()
         self._init_transactions()
         self._init_transactions_tab()
         self._init_budgets()
         self._init_charts()
         self._init_reports_tab()
-        self._init_reconcile()
+        self._init_accounts()
         self._init_balance_sheet()
         self._init_category_rules()
         self._init_sync_tab()
 
         logging.getLogger().addHandler(self.tab_log.log_handler)
-        # Data-view tabs refresh automatically when they become active.
-        # Input/action tabs are intentionally excluded so navigation never
-        # resets an in-progress form or operation.
 
-        # --- NEW: Schedule background integrity checks WITH A DELAY ---
-        self.integrity_checker = None
+        test_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test")
+        self.test_manager = TestRunnerManager(self.db_dir, test_dir, self)
+        self.test_manager.log_output.connect(self._log_audit_message)
+        self.test_manager.audit_completed.connect(self._on_audit_completed)
 
-        # Wait 5 seconds (5000ms) after the UI is fully drawn before starting.
-        # This ensures the user can interact with the app immediately upon launch.
-        QTimer.singleShot(5000, self._schedule_integrity_check)
+        QTimer.singleShot(5000, self._start_audit_sequence)
 
-        # Data-view tabs refresh automatically...
         self.tabs.currentChanged.connect(self._refresh_current_tab)
 
-    def _schedule_integrity_check(self):
-        """Checks the cooldown and triggers the background test runner if due."""
-        db_dir = os.path.dirname(self.gl.db_path)
+        self.backup_timer = QTimer(self)
+        self.backup_timer.timeout.connect(lambda: self._create_safety_backup("periodic"))
+        self.backup_timer.start(4 * 60 * 60 * 1000)
 
-        if should_run_integrity_check(db_dir, cooldown_days=7):
-            # Show a non-blocking message to the user
-            QMessageBox.information(
-                self,
-                "Weekly Integrity Check",
-                "CogniFinance is running its weekly mathematical integrity checks in the background.\n\n"
-                "This verifies that your ledger's accounting equation and audit trails are perfectly balanced.\n\n"
-                "The app might be slightly slower for the next minute while these tests run. "
-                "You can view the live progress in the 'Logs' tab."
-            )
+    def safe_trigger_audit(self):
+        """Safely initiates scheduled integrity checks."""
+        self._start_audit_sequence()
 
-            main_dir = os.path.dirname(os.path.abspath(__file__))
-            test_dir = os.path.join(main_dir, "test")
+    def _create_safety_backup(self, trigger: str = "manual"):
+        """Bridge interface for timed/event-based silent backups."""
+        self._run_silent_auto_backup(trigger=trigger)
 
-            # Start the QProcess-based checker
-            self.integrity_checker = IntegrityChecker(test_dir)
-            self.integrity_checker.log_output.connect(self._log_integrity_message)
-            self.integrity_checker.finished_signal.connect(self._on_integrity_finished)
-            self.integrity_checker.start()
+    def _start_audit_sequence(self):
+        """Wrapper to show the UI notification before kicking off the manager."""
+        if getattr(self, 'sync_server', None) is not None:
+            QTimer.singleShot(30000, self.safe_trigger_audit)
+            self.statusBar().showMessage("Integrity audit deferred: Mobile sync currently active.", 4000)
+            return
 
-    def _log_integrity_message(self, message: str):
-        """Routes the pytest output directly into the Log Tab."""
-        import logging
-        # We use the root logger so it hits the QtLogHandler and goes to the UI
-        if "PASSED" in message or "SUCCESS" in message:
-            logging.info(message)
-        elif "FAILED" in message or "ERROR" in message or "CRITICAL" in message:
+        self.sync_start_button.setEnabled(False)
+        self.sync_start_button.setToolTip("Sync temporarily locked: Background system audit in progress (~1 min).")
+
+        self.notifications.add(
+            Severity.INFO,
+            "Running Background Integrity Checks",
+            "CogniFinance is verifying your ledger's math and security in the background. "
+            "Program might experience slow down during tests.",
+            "integrity_check_running"
+        )
+        self.test_manager.start_scheduled_audit()
+
+    def _log_audit_message(self, message: str):
+        """Routes the test output directly into the Log Tab."""
+        if not message.strip():
+            return
+
+        if message.startswith(("platform ", "rootdir:", "configfile:", "plugins:", "cache_dir:")):
+            return
+
+        if message.startswith("collected "):
+            return
+
+        if message.startswith("===") and not any(k in message.lower() for k in ["passed", "failed", "error"]):
+            return
+
+        if any(keyword in message for keyword in ["FAILED", "ERROR", "CRITICAL", "❌", "___"]):
             logging.error(message)
         else:
-            logging.debug(message)
+            logging.info(message)
 
-    def _on_integrity_finished(self, success: bool, summary: str):
-        """Called when the background thread finishes."""
-        db_dir = os.path.dirname(self.gl.db_path)
+    def _on_audit_completed(self, success: bool, message: str):
+        """Called when the entire audit sequence (Weekly + Deep) finishes."""
+        self.notifications.resolve("integrity_check_running")
+        self.sync_start_button.setEnabled(True)
+        self.sync_start_button.setToolTip("Start Mobile Sync")
 
         if success:
-            # Only update the cooldown if the tests actually passed
-            save_cooldown_timestamp(db_dir)
-            # Optional: Show a final success popup, or just let the Log Tab handle it
-            # QMessageBox.information(self, "Integrity Verified", summary)
+            self.notifications.add(
+                Severity.INFO,
+                "Integrity Checks Complete",
+                message,
+                "integrity_check_complete"
+            )
+            self._log_audit_message(f"✅ {message}")
+            self.notifications.resolve("weekly_integrity_check")
+            self.notifications.resolve("deep_integrity_check")
         else:
-            # CRITICAL: If it fails, we DO NOT update the cooldown, so it will
-            # try again next time the app is opened, and we alert the user loudly.
+            self.notifications.add(
+                Severity.CRITICAL,
+                "Integrity Check Failed",
+                message,
+                "integrity_check_failed"
+            )
+            self._log_audit_message(f"❌ {message}")
             QMessageBox.critical(
                 self,
                 "CRITICAL LEDGER FAILURE",
-                f"The weekly integrity check FAILED.\n\n"
-                f"{summary}\n\n"
-                "Please open the 'Logs' tab to see exactly which mathematical "
-                "invariants were violated. Your data may be corrupted."
+                f"The background integrity check FAILED.\n\n{message}\n\n"
+                "Please open the 'Logs' tab to see exactly which invariants were violated."
             )
 
     def _add_refresh_row(self, layout, callback, search_line=None):
@@ -216,10 +241,28 @@ class BudgetApp(QMainWindow):
         if refresher is not None:
             refresher()
 
-        # Make sure tables in the newly shown tab get sensible widths.
         if widget is not None:
             for table in widget.findChildren(QTableWidget):
                 self._fit_table_columns(table)
+
+    def _position_notification_bell(self):
+        """Pins the notification bell to the top-right corner of the HTML area."""
+        if not hasattr(self, 'overview_text') or not hasattr(self, 'notification_bell'):
+            return
+
+        padding = 15
+        x = self.overview_text.width() - self.notification_bell.width() - padding
+        y = padding
+
+        self.notification_bell.move(x, y)
+        self.notification_bell.raise_()
+
+    def eventFilter(self, obj, event):
+        """Intercepts resize events to keep the bell pinned to the corner."""
+        if obj == getattr(self, 'overview_text', None) and event.type() == QEvent.Type.Resize:
+            self._position_notification_bell()
+
+        return super().eventFilter(obj, event)
 
     def _init_accounts(self):
         layout = QVBoxLayout(self.tab_accounts)
@@ -263,7 +306,7 @@ class BudgetApp(QMainWindow):
         type_combo = QComboBox()
         for t in ["Asset", "Liability", "Equity", "Revenue", "Expense"]:
             type_combo.addItem(t)
-        type_combo.setCurrentText("Expense") # Default to Expense for easy category creation
+        type_combo.setCurrentText("Expense")
 
         form.addRow("Account Name:", name_edit)
         form.addRow("Account Type:", type_combo)
@@ -283,7 +326,7 @@ class BudgetApp(QMainWindow):
             ok, msg = self.gl.create_account(name, acc_type)
             if ok:
                 self.refresh_accounts_table()
-                self.refresh_account_combos() # Crucial: Updates all dropdowns app-wide
+                self.refresh_account_combos()
                 QMessageBox.information(self, "Success", msg)
             else:
                 QMessageBox.warning(self, "Error", msg)
@@ -344,11 +387,10 @@ class BudgetApp(QMainWindow):
                 logger.error(f"OFX Import failed for {os.path.basename(file_path)}: {e}")
                 QMessageBox.critical(self, "Import Failed", f"Error processing {os.path.basename(file_path)}:\n{e}")
 
-        # Refresh all views
         self.apply_transaction_filters()
         self.apply_transactions_tab_filters()
         self.refresh_overview()
-        self.refresh_account_combos() # Crucial: Updates dropdowns with newly created bank accounts
+        self.refresh_account_combos()
 
         QMessageBox.information(
             self,
@@ -360,13 +402,9 @@ class BudgetApp(QMainWindow):
         )
 
     def _money_item(self, value, editable=False):
-        """
-        Create a right-aligned, non-editable table item for monetary values.
-        """
+        """Create a right-aligned, non-editable table item for monetary values."""
         item = QTableWidgetItem(f"{value:,.2f}")
-        item.setTextAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        )
+        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         if not editable:
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -374,12 +412,6 @@ class BudgetApp(QMainWindow):
         return item
 
     def _setup_table_headers(self, table: QTableWidget, fractions=None):
-        """
-        Make table columns user-adjustable and give them sensible default widths.
-
-        fractions should be a list/tuple of floats, one per column.
-        The last column is allowed to stretch to fill the remaining width.
-        """
         table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -397,62 +429,33 @@ class BudgetApp(QMainWindow):
             table.setProperty("user_adjusted", False)
             table.setProperty("applying_widths", False)
 
-            header.sectionResized.connect(
-                lambda *_: self._table_section_resized(table)
-            )
-
+            header.sectionResized.connect(lambda *_: self._table_section_resized(table))
             QTimer.singleShot(0, lambda: self._fit_table_columns(table))
 
-
     def _table_section_resized(self, table: QTableWidget):
-        """
-        Track when the user manually resizes a column so we do not override it later.
-        """
         if table.property("applying_widths"):
             return
-
         table.setProperty("user_adjusted", True)
 
-
     def _fit_table_columns(self, table: QTableWidget):
-        """
-        Apply initial proportional column widths.
-        """
         fractions = table.property("fractions")
-
-        if not fractions:
-            return
-
-        if table.property("user_adjusted"):
+        if not fractions or table.property("user_adjusted"):
             return
 
         column_count = table.columnCount()
         if column_count == 0:
             return
 
-        total_width = table.viewport().width()
-        if total_width <= 0:
-            total_width = table.width()
-
-        if total_width <= 0:
-            total_width = 1000
-
+        total_width = table.viewport().width() or table.width() or 1000
         usable_width = max(200, total_width - 2)
         last_column = column_count - 1
 
         table.setProperty("applying_widths", True)
-
         try:
             for col in range(column_count):
-                # Let the last column stretch naturally.
                 if col == last_column:
                     continue
-
-                if col < len(fractions):
-                    fraction = fractions[col]
-                else:
-                    fraction = 1.0 / column_count
-
+                fraction = fractions[col] if col < len(fractions) else 1.0 / column_count
                 width = max(70, int(usable_width * fraction))
                 table.setColumnWidth(col, width)
         finally:
@@ -463,6 +466,15 @@ class BudgetApp(QMainWindow):
         self.overview_text = QTextEdit()
         self.overview_text.setReadOnly(True)
         self.overview_text.setFont(QFont("Monospace", 10))
+
+        self.notification_bell = NotificationBell(self.notifications, self)
+        self.notification_bell.setParent(self.overview_text)
+
+        self.overview_text.installEventFilter(self)
+        self._position_notification_bell()
+        self.notification_bell.raise_()
+        self.notification_bell.show()
+
         layout.addWidget(self.overview_text)
         self._add_refresh_row(layout, self.refresh_overview)
 
@@ -486,7 +498,6 @@ class BudgetApp(QMainWindow):
         statement_row.addWidget(self.import_statement_type)
 
         statement_row.addStretch()
-
         layout.addLayout(statement_row)
 
         btn_export = QPushButton("Export Ledger (CSV)")
@@ -500,8 +511,8 @@ class BudgetApp(QMainWindow):
 
         btn_row.addWidget(self.btn_import_pdf)
         btn_row.addWidget(btn_import_ofx)
-        btn_row.addWidget(btn_export)
         btn_row.addWidget(btn_import)
+        btn_row.addWidget(btn_export)
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
@@ -512,7 +523,6 @@ class BudgetApp(QMainWindow):
 
         today = QDate.currentDate()
         month = today.toString("yyyy-MM")
-
         report = self.gl.monthly_income_expense_report(today.year(), today.month())
 
         label_style = "width: 100%; white-space: pre; padding-right: 10px;"
@@ -535,65 +545,27 @@ class BudgetApp(QMainWindow):
             return f'<div style="{section_style}">{escape(str(title))}</div>'
 
         def table(rows):
-            return (
-                '<table width="100%" cellspacing="0" cellpadding="2">'
-                + "".join(rows)
-                + "</table>"
-            )
+            return '<table width="100%" cellspacing="0" cellpadding="2">' + "".join(rows) + "</table>"
 
         net_color = "#007a00" if report["net"] >= ZERO else "#b00000"
 
-        month_rows = [
-            amount_row("Income", report["income_total"]),
-            amount_row("Expenses", report["expense_total"]),
-            amount_row("Net", report["net"], bold=True, color=net_color),
-        ]
-
-
-
-        # ------------------------------------------------------------
-        # Budget alerts
-        # ------------------------------------------------------------
-        budgets = [
-            b
-            for b in self.gl.get_all_budgets()
-            if b.month == month
-        ]
-
+        budgets = [b for b in self.gl.get_all_budgets() if b.month == month]
         spending = self.gl.spending_by_category(month)
-
         alert_rows = []
 
         for b in sorted(budgets, key=lambda x: x.category):
             actual = spending.get(b.category, ZERO)
-
             if actual > b.amount:
                 over_by = actual - b.amount
-                alert_rows.append(
-                    amount_row(
-                        f"{b.category} over budget",
-                        over_by,
-                        color="#b00000"
-                    )
-                )
+                alert_rows.append(amount_row(f"{b.category} over budget", over_by, color="#b00000"))
 
         if not alert_rows:
-            if budgets:
-                alert_rows.append(
-                    f'<tr><td style="{muted_style}">No budget overruns this month.</td></tr>'
-                )
-            else:
-                alert_rows.append(
-                    f'<tr><td style="{muted_style}">No budgets set for this month.</td></tr>'
-                )
-        # ------------------------------------------------------------
-        # Recent transactions
-        # ------------------------------------------------------------
-        recent_rows = []
+            msg = "No budget overruns this month." if budgets else "No budgets set for this month."
+            alert_rows.append(f'<tr><td style="{muted_style}">{msg}</td></tr>')
 
+        recent_rows = []
         for tx in list(reversed(self.gl.transactions[-10:])):
             amount = self._transaction_display_amount(tx)
-
             recent_rows.append(
                 "<tr>"
                 f'<td style="white-space: pre;">{escape(tx.date)}</td>'
@@ -603,18 +575,10 @@ class BudgetApp(QMainWindow):
             )
 
         if not recent_rows:
-            recent_rows.append(
-                f'<tr><td style="{muted_style}">No transactions yet.</td></tr>'
-            )
+            recent_rows.append(f'<tr><td style="{muted_style}">No transactions yet.</td></tr>')
 
-        # ------------------------------------------------------------
-        # Reconciliation
-        # ------------------------------------------------------------
         unreconciled_count = len(self.gl.get_unreconciled_transactions())
-
-        reconciliation_rows = [
-            f"<tr><td>{unreconciled_count} unreconciled transaction(s)</td></tr>"
-        ]
+        reconciliation_rows = [f"<tr><td>{unreconciled_count} unreconciled transaction(s)</td></tr>"]
 
         html = f"""
         <html>
@@ -635,8 +599,6 @@ class BudgetApp(QMainWindow):
                 <li>View balance sheet and export/import ledger CSV</li>
             </ul>
             <br/>
-
-
             {section("Budget Alerts")}
             {table(alert_rows)}
             <br>
@@ -671,29 +633,10 @@ class BudgetApp(QMainWindow):
         self.filter_search.setPlaceholderText("Search description or account...")
         self.filter_search.setClearButtonEnabled(True)
 
-        self._add_refresh_row(
-            layout,
-            self.apply_transaction_filters,
-            self.filter_search
-        )
+        self._add_refresh_row(layout, self.apply_transaction_filters, self.filter_search)
 
         filter_box = QGroupBox("Filters")
         flayout = QFormLayout()
-
-        self.filter_start = QDateEdit()
-        self.filter_start.setCalendarPopup(True)
-
-        self.filter_end = QDateEdit()
-        self.filter_end.setCalendarPopup(True)
-        self.filter_end.setDate(QDate.currentDate())
-
-        self.filter_account = QComboBox()
-        self.filter_account.addItem("All accounts", "")
-        for name in sorted(self.gl.accounts.keys()):
-            self.filter_account.addItem(name, name)
-
-        self.filter_search = QLineEdit()
-        self.filter_search.setPlaceholderText("Search description or account...")
 
         flayout.addRow("From:", self.filter_start)
         flayout.addRow("To:", self.filter_end)
@@ -711,44 +654,28 @@ class BudgetApp(QMainWindow):
 
         self.tx_table = QTableWidget()
         self.tx_table.setColumnCount(4)
-        self.tx_table.setHorizontalHeaderLabels(
-            ["Date", "Description", "Accounts", "Amount"]
-        )
-
-        self._setup_table_headers(
-            self.tx_table,
-            [0.11, 0.42, 0.31, 0.16]
-        )
+        self.tx_table.setHorizontalHeaderLabels(["Date", "Description", "Accounts", "Amount"])
+        self._setup_table_headers(self.tx_table, [0.11, 0.42, 0.31, 0.16])
 
         layout.addWidget(self.tx_table)
-
         self.apply_transaction_filters()
 
     def _transaction_display_amount(self, tx) -> Decimal:
-        from decimal import Decimal
-
-
         amount = Decimal("0.00")
-
-    # Prefer expense debit
         for line in tx.lines:
             acc = self.gl.accounts[line.account_name]
             if acc.account_type == "Expense" and line.dr > 0:
                 amount += line.dr
-
         if amount > 0:
             return amount
 
-    # Then revenue credit
         for line in tx.lines:
             acc = self.gl.accounts[line.account_name]
             if acc.account_type == "Revenue" and line.cr > 0:
                 amount += line.cr
-
         if amount > 0:
             return amount
 
-    # Fallback: first non-zero debit or credit
         for line in tx.lines:
             if line.dr > 0:
                 return line.dr
@@ -756,7 +683,6 @@ class BudgetApp(QMainWindow):
                 return line.cr
 
         return Decimal("0.00")
-
 
     def apply_transaction_filters(self):
         start = self.filter_start.date().toString("yyyy-MM-dd") or None
@@ -772,7 +698,6 @@ class BudgetApp(QMainWindow):
             self.tx_table.setItem(row, 1, QTableWidgetItem(tx.description))
             accs = ", ".join(l.account_name for l in tx.lines)
             self.tx_table.setItem(row, 2, QTableWidgetItem(accs))
-            amount = sum(l.dr for l in tx.lines if self.gl.accounts[l.account_name].account_type == "Expense")
             amount = self._transaction_display_amount(tx)
             self.tx_table.setItem(row, 3, QTableWidgetItem(f"{amount:,.2f}"))
 
@@ -821,7 +746,6 @@ class BudgetApp(QMainWindow):
         flay2 = QFormLayout()
 
         today = QDate.currentDate()
-
         self.tx_filter_start = QDateEdit()
         self.tx_filter_start.setCalendarPopup(True)
         self.tx_filter_start.setDate(QDate(today.year(), today.month(), 1))
@@ -847,7 +771,6 @@ class BudgetApp(QMainWindow):
         layout.addWidget(btn_apply)
 
         btn_edit_row = QHBoxLayout()
-
         btn_edit = QPushButton("Edit Selected")
         btn_edit.clicked.connect(self.edit_selected_transaction)
 
@@ -866,17 +789,11 @@ class BudgetApp(QMainWindow):
 
         self.tx_table2 = QTableWidget()
         self.tx_table2.setColumnCount(5)
-        self.tx_table2.setHorizontalHeaderLabels(
-            ["Date", "Description", "From", "To", "Amount"]
-        )
-
-        self._setup_table_headers(
-            self.tx_table2,
-            [0.11, 0.37, 0.18, 0.18, 0.16]
-        )
+        self.tx_table2.setHorizontalHeaderLabels(["Date", "Description", "From", "To", "Amount"])
+        self._setup_table_headers(self.tx_table2, [0.11, 0.37, 0.18, 0.18, 0.16])
+        self.tx_table2.doubleClicked.connect(self.edit_selected_transaction)
 
         layout.addWidget(self.tx_table2)
-
         self.apply_transactions_tab_filters()
 
     def post_quick_transaction(self):
@@ -936,11 +853,7 @@ class BudgetApp(QMainWindow):
             self.tx_from.addItem(name, name)
             self.tx_to.addItem(name, name)
 
-        expense_accounts = [
-            name
-            for name, acc in self.gl.accounts.items()
-            if acc.account_type == "Expense"
-        ]
+        expense_accounts = [name for name, acc in self.gl.accounts.items() if acc.account_type == "Expense"]
 
         for name in sorted(expense_accounts):
             self.budget_category.addItem(name, name)
@@ -981,8 +894,8 @@ class BudgetApp(QMainWindow):
             self.tx_table2.setItem(row, 1, QTableWidgetItem(tx.description))
 
             if len(tx.lines) >= 2:
-                from_acc = tx.lines[0].account_name
-                to_acc = tx.lines[1].account_name
+                from_acc = tx.lines[1].account_name
+                to_acc = tx.lines[0].account_name
             else:
                 from_acc = tx.lines[0].account_name if tx.lines else ""
                 to_acc = ""
@@ -1003,20 +916,13 @@ class BudgetApp(QMainWindow):
 
     def _init_budgets(self):
         layout = QVBoxLayout(self.tab_budgets)
-
         self._add_refresh_row(layout, self.refresh_budget_list)
 
         form_box = QGroupBox("Set Monthly Budget")
         flayout = QFormLayout()
 
         self.budget_category = QComboBox()
-
-        expense_accounts = [
-            name
-            for name, acc in self.gl.accounts.items()
-            if acc.account_type == "Expense"
-        ]
-
+        expense_accounts = [name for name, acc in self.gl.accounts.items() if acc.account_type == "Expense"]
         for name in sorted(expense_accounts):
             self.budget_category.addItem(name, name)
 
@@ -1035,18 +941,14 @@ class BudgetApp(QMainWindow):
         layout.addWidget(form_box)
 
         btn_row = QHBoxLayout()
-
         btn_save = QPushButton("Save Budget")
         btn_save.clicked.connect(self.save_budget)
-
         btn_row.addWidget(btn_save)
         btn_row.addStretch()
-
         layout.addLayout(btn_row)
 
         view_box = QGroupBox("Budget vs Actual")
         view_layout = QHBoxLayout()
-
         view_layout.addWidget(QLabel("Budget Month:"))
 
         self.budget_view_month = QDateEdit()
@@ -1056,52 +958,30 @@ class BudgetApp(QMainWindow):
 
         view_layout.addWidget(self.budget_view_month)
         view_layout.addStretch()
-
         view_box.setLayout(view_layout)
         layout.addWidget(view_box)
 
         self.budget_table = QTableWidget()
-        self.budget_table.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
-        )
         self.budget_table.setColumnCount(5)
-        self.budget_table.setHorizontalHeaderLabels(
-            ["Category", "Budget", "Actual", "Difference", "Used"]
-        )
+        self.budget_table.setHorizontalHeaderLabels(["Category", "Budget", "Actual", "Difference", "Used"])
 
         self._setup_table_headers(self.budget_table)
-
-        self.budget_table.setColumnWidth(0, 320)
-        self.budget_table.setColumnWidth(1, 110)
-        self.budget_table.setColumnWidth(2, 110)
-        self.budget_table.setColumnWidth(3, 120)
-        self.budget_table.setColumnWidth(4, 80)
-
         layout.addWidget(self.budget_table)
 
-        self.budget_view_month.dateChanged.connect(
-            lambda *_: self.refresh_budget_list()
-        )
+        self.budget_view_month.dateChanged.connect(lambda *_: self.refresh_budget_list())
 
         budget_action_row = QHBoxLayout()
+        btn_edit_budget = QPushButton("Edit Selected Budget")
+        btn_edit_budget.clicked.connect(self.edit_selected_budget)
+        budget_action_row.addWidget(btn_edit_budget)
+        self.budget_table.doubleClicked.connect(lambda *_: self.edit_selected_budget())
 
-        if hasattr(self, "edit_selected_budget"):
-            btn_edit_budget = QPushButton("Edit Selected Budget")
-            btn_edit_budget.clicked.connect(self.edit_selected_budget)
-            budget_action_row.addWidget(btn_edit_budget)
+        btn_delete_budget = QPushButton("Delete Selected Budget")
+        btn_delete_budget.clicked.connect(self.delete_selected_budget)
+        budget_action_row.addWidget(btn_delete_budget)
 
-            self.budget_table.doubleClicked.connect(
-                lambda *_: self.edit_selected_budget()
-            )
-
-        if hasattr(self, "delete_selected_budget"):
-            btn_delete_budget = QPushButton("Delete Selected Budget")
-            btn_delete_budget.clicked.connect(self.delete_selected_budget)
-            budget_action_row.addWidget(btn_delete_budget)
-
-        if budget_action_row.count():
-            budget_action_row.addStretch()
-            layout.addLayout(budget_action_row)
+        budget_action_row.addStretch()
+        layout.addLayout(budget_action_row)
 
         self.refresh_budget_list()
 
@@ -1126,34 +1006,20 @@ class BudgetApp(QMainWindow):
             QMessageBox.warning(self, "Budget error", msg)
 
     def refresh_budget_list(self):
-        if hasattr(self, "budget_view_month"):
-            month = self.budget_view_month.date().toString("yyyy-MM")
-        else:
-            month = self.budget_month.date().toString("yyyy-MM")
-
-        budgets = [
-            b
-            for b in self.gl.get_all_budgets()
-            if b.month == month
-        ]
-
+        month = self.budget_view_month.date().toString("yyyy-MM") if hasattr(self, "budget_view_month") else self.budget_month.date().toString("yyyy-MM")
+        budgets = [b for b in self.gl.get_all_budgets() if b.month == month]
         actuals = self.gl.spending_by_category(month)
 
         self.budget_table.setRowCount(len(budgets))
-
-        red = QColor("#b00000")
-        green = QColor("#007a00")
-        orange = QColor("#b06000")
+        red, green, orange = QColor("#b00000"), QColor("#007a00"), QColor("#b06000")
 
         for row, b in enumerate(budgets):
             actual = actuals.get(b.category, ZERO)
             diff = b.amount - actual
 
             category_item = QTableWidgetItem(b.category)
-
             budget_item = self._money_item(b.amount)
             budget_item.setData(Qt.ItemDataRole.UserRole, float(b.amount))
-
             actual_item = self._money_item(actual)
             diff_item = self._money_item(diff)
 
@@ -1169,10 +1035,7 @@ class BudgetApp(QMainWindow):
 
             if b.amount > ZERO:
                 used = (actual / b.amount) * Decimal("100")
-                used_text = f"{used:.0f}%"
-
-                used_item = QTableWidgetItem(used_text)
-
+                used_item = QTableWidgetItem(f"{used:.0f}%")
                 if used > Decimal("100"):
                     used_item.setForeground(red)
                 elif used > Decimal("90"):
@@ -1183,17 +1046,9 @@ class BudgetApp(QMainWindow):
                 used_item = QTableWidgetItem("Over" if actual > ZERO else "0%")
                 used_item.setForeground(red if actual > ZERO else green)
 
-            used_item.setTextAlignment(
-                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-            )
+            used_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
-            for item in (
-                category_item,
-                budget_item,
-                actual_item,
-                diff_item,
-                used_item,
-            ):
+            for item in (category_item, budget_item, actual_item, diff_item, used_item):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
             self.budget_table.setItem(row, 0, category_item)
@@ -1203,11 +1058,7 @@ class BudgetApp(QMainWindow):
             self.budget_table.setItem(row, 4, used_item)
 
     def _selected_budget_data(self):
-        """
-        Return (category, month, amount) for the selected budget row.
-        """
         row = self.budget_table.currentRow()
-
         if row < 0:
             selected = self.budget_table.selectedItems()
             if not selected:
@@ -1223,11 +1074,7 @@ class BudgetApp(QMainWindow):
         if category_item is None or budget_item is None:
             return None
 
-        if hasattr(self, "budget_view_month"):
-            month = self.budget_view_month.date().toString("yyyy-MM")
-        else:
-            month = self.budget_month.date().toString("yyyy-MM")
-
+        month = self.budget_view_month.date().toString("yyyy-MM") if hasattr(self, "budget_view_month") else self.budget_month.date().toString("yyyy-MM")
         amount = budget_item.data(Qt.ItemDataRole.UserRole)
 
         if amount is None:
@@ -1238,62 +1085,43 @@ class BudgetApp(QMainWindow):
 
         return category_item.text(), month, float(amount)
 
-
     def edit_selected_budget(self):
         selection = self._selected_budget_data()
-
         if selection is None:
-            QMessageBox.information(
-                self,
-                "No selection",
-                "Please select a budget row to edit."
-            )
+            QMessageBox.information(self, "No selection", "Please select a budget row to edit.")
             return
 
         category, month, amount = selection
-
         dlg = QDialog(self)
         dlg.setWindowTitle("Edit Budget")
 
         layout = QVBoxLayout(dlg)
         form = QFormLayout()
-
         form.addRow("Category:", QLabel(category))
         form.addRow("Month:", QLabel(month))
 
         amount_edit = QLineEdit(f"{amount:.2f}")
         form.addRow("Budget Amount:", amount_edit)
-
         layout.addLayout(form)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save |
-            QDialogButtonBox.StandardButton.Cancel
-        )
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
-
         layout.addWidget(buttons)
 
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
         text = amount_edit.text().strip().replace(",", "")
-
         try:
             new_amount = float(text)
             if new_amount < 0:
                 raise ValueError()
         except ValueError:
-            QMessageBox.warning(
-                self,
-                "Invalid amount",
-                "Please enter a valid non-negative number."
-            )
+            QMessageBox.warning(self, "Invalid amount", "Please enter a valid non-negative number.")
             return
 
         ok, msg = self.gl.set_budget(category, month, new_amount)
-
         if ok:
             QMessageBox.information(self, "Budget updated", msg)
             self.refresh_budget_list()
@@ -1301,20 +1129,13 @@ class BudgetApp(QMainWindow):
             logger.warning(f"Failed to save budget for {category} ({month}): {msg}")
             QMessageBox.warning(self, "Budget error", msg)
 
-
     def delete_selected_budget(self):
         selection = self._selected_budget_data()
-
         if selection is None:
-            QMessageBox.information(
-                self,
-                "No selection",
-                "Please select a budget row to delete."
-            )
+            QMessageBox.information(self, "No selection", "Please select a budget row to delete.")
             return
 
         category, month, _ = selection
-
         reply = QMessageBox.question(
             self,
             "Delete budget",
@@ -1327,7 +1148,6 @@ class BudgetApp(QMainWindow):
             return
 
         ok, msg = self.gl.delete_budget(category, month)
-
         if ok:
             QMessageBox.information(self, "Budget deleted", msg)
             self.refresh_budget_list()
@@ -1383,13 +1203,11 @@ class BudgetApp(QMainWindow):
         month_box = QGroupBox("Month")
         mlayout = QFormLayout()
 
-        # Get current date components once
         current_date = QDate.currentDate()
         current_year = current_date.year()
         current_month = current_date.month()
 
         self.report_year = QComboBox()
-        current_year = QDate.currentDate().year()
         for y in range(current_year - 5, current_year + 2):
             self.report_year.addItem(str(y), y)
         self.report_year.setCurrentText(str(current_year))
@@ -1424,7 +1242,6 @@ class BudgetApp(QMainWindow):
 
         year = self.report_year.currentData()
         month = self.report_month.currentData()
-
         data = self.gl.monthly_income_expense_report(year, month)
 
         label_style = "width: 100%; white-space: pre; padding-right: 12px;"
@@ -1434,7 +1251,6 @@ class BudgetApp(QMainWindow):
         def row(label, amount, bold=False, indent=0):
             weight = "font-weight: bold;" if bold else ""
             left_pad = f"padding-left: {indent * 18}px;"
-
             return (
                 "<tr>"
                 f'<td style="{label_style}{weight}{left_pad}">{escape(str(label))}</td>'
@@ -1443,27 +1259,10 @@ class BudgetApp(QMainWindow):
             )
 
         def section(title):
-            return (
-                f'<tr><td colspan="2" style="{section_style}">'
-                f"{escape(str(title))}"
-                "</td></tr>"
-            )
+            return f'<tr><td colspan="2" style="{section_style}">{escape(str(title))}</td></tr>'
 
-        income_rows = "".join(
-            row(acc, amt, indent=1)
-            for acc, amt in data["income_by_account"].items()
-        )
-
-        if not income_rows:
-            income_rows = row("(none)", ZERO, indent=1)
-
-        expense_rows = "".join(
-            row(acc, amt, indent=1)
-            for acc, amt in data["expense_by_account"].items()
-        )
-
-        if not expense_rows:
-            expense_rows = row("(none)", ZERO, indent=1)
+        income_rows = "".join(row(acc, amt, indent=1) for acc, amt in data["income_by_account"].items()) or row("(none)", ZERO, indent=1)
+        expense_rows = "".join(row(acc, amt, indent=1) for acc, amt in data["expense_by_account"].items()) or row("(none)", ZERO, indent=1)
 
         html = f"""
         <html>
@@ -1486,19 +1285,13 @@ class BudgetApp(QMainWindow):
         </body>
         </html>
         """
-
         self.report_summary.setHtml(html)
 
     def export_monthly_report(self):
         year = self.report_year.currentData()
         month = self.report_month.currentData()
 
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Monthly Report",
-            "",
-            "Excel Files (*.xlsx);;All Files (*)",
-        )
+        path, _ = QFileDialog.getSaveFileName(self, "Export Monthly Report", "", "Excel Files (*.xlsx);;All Files (*)")
         if not path:
             return
         if not path.endswith(".xlsx"):
@@ -1512,7 +1305,6 @@ class BudgetApp(QMainWindow):
 
     def _init_reconcile(self):
         layout = QVBoxLayout(self.tab_reconcile)
-
         self._add_refresh_row(layout, self.load_unreconciled)
 
         info = QLabel(
@@ -1523,25 +1315,16 @@ class BudgetApp(QMainWindow):
 
         self.reconcile_table = QTableWidget()
         self.reconcile_table.setColumnCount(5)
-        self.reconcile_table.setHorizontalHeaderLabels(
-            ["ID", "Date", "Description", "Imported ID", "Reconciled"]
-        )
-
-        self._setup_table_headers(
-            self.reconcile_table,
-            [0.08, 0.13, 0.52, 0.17, 0.10]
-        )
-
+        self.reconcile_table.setHorizontalHeaderLabels(["ID", "Date", "Description", "Imported ID", "Reconciled"])
+        self._setup_table_headers(self.reconcile_table, [0.08, 0.13, 0.52, 0.17, 0.10])
         layout.addWidget(self.reconcile_table)
 
         btn_row = QHBoxLayout()
-
         btn_mark = QPushButton("Mark Selected as Reconciled")
         btn_mark.clicked.connect(self.mark_selected_reconciled)
 
         btn_row.addWidget(btn_mark)
         btn_row.addStretch()
-
         layout.addLayout(btn_row)
 
         self.load_unreconciled()
@@ -1599,7 +1382,6 @@ class BudgetApp(QMainWindow):
         def row(label, amount, bold=False, indent=0):
             weight = "font-weight: bold;" if bold else ""
             left_pad = f"padding-left: {indent * 18}px;"
-
             return (
                 "<tr>"
                 f'<td style="{label_style}{weight}{left_pad}">{escape(str(label))}</td>'
@@ -1608,11 +1390,7 @@ class BudgetApp(QMainWindow):
             )
 
         def section(title):
-            return (
-                f'<tr><td colspan="2" style="{section_style}">'
-                f"{escape(str(title))}"
-                "</td></tr>"
-            )
+            return f'<tr><td colspan="2" style="{section_style}">{escape(str(title))}</td></tr>'
 
         def rule():
             return '<tr><td colspan="2"><hr/></td></tr>'
@@ -1622,7 +1400,6 @@ class BudgetApp(QMainWindow):
 
         def section_rows(title, section_data):
             rows = [section(title)]
-
             for name, bal in section_data["accounts"].items():
                 dname = (name[:28] + "..") if len(name) > 30 else name
                 rows.append(row(dname, bal, indent=1))
@@ -1630,21 +1407,14 @@ class BudgetApp(QMainWindow):
             rows.append(rule())
             rows.append(row(f"TOTAL {title}", section_data["total"], bold=True))
             rows.append(spacer(2))
-
             return "".join(rows)
 
-        net = (
-            bs["assets"]["total"]
-            - bs["liabilities"]["total"]
-            - bs["equity"]["total"]
-        )
+        net = bs["assets"]["total"] - bs["liabilities"]["total"] - bs["equity"]["total"]
 
         html = f"""
         <html>
         <body style="font-family: 'Inter', sans-serif; font-size: 10pt;">
-            <div style="font-weight: bold; font-size: 12pt;">
-                BALANCE SHEET
-            </div>
+            <div style="font-weight: bold; font-size: 12pt;">BALANCE SHEET</div>
             <br/>
             <table width="100%" cellspacing="0" cellpadding="1">
                 {section_rows('Assets', bs['assets'])}
@@ -1664,13 +1434,10 @@ class BudgetApp(QMainWindow):
         </body>
         </html>
         """
-
         self.balance_text.setHtml(html)
 
     def export_ledger_csv(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Ledger CSV", "", "CSV Files (*.csv);;All Files (*)"
-        )
+        path, _ = QFileDialog.getSaveFileName(self, "Export Ledger CSV", "", "CSV Files (*.csv);;All Files (*)")
         if not path:
             return
         try:
@@ -1680,9 +1447,7 @@ class BudgetApp(QMainWindow):
             QMessageBox.critical(self, "Export failed", str(e))
 
     def import_ledger_csv(self):
-        files, _ = QFileDialog.getOpenFileNames(
-            self, "Import Ledger CSV", "", "CSV Files (*.csv);;All Files (*)"
-        )
+        files, _ = QFileDialog.getOpenFileNames(self, "Import Ledger CSV", "", "CSV Files (*.csv);;All Files (*)")
         if not files:
             return
         total = 0
@@ -1696,9 +1461,7 @@ class BudgetApp(QMainWindow):
         self.apply_transaction_filters()
 
     def import_statement_pdf(self):
-        files, _ = QFileDialog.getOpenFileNames(
-            self, "Import Bank Statement PDF", "", "PDF Files (*.pdf);;All Files (*)"
-        )
+        files, _ = QFileDialog.getOpenFileNames(self, "Import Bank Statement PDF", "", "PDF Files (*.pdf);;All Files (*)")
         if not files:
             return
 
@@ -1712,29 +1475,20 @@ class BudgetApp(QMainWindow):
 
         bank = self.import_bank.currentData()
         statement_type = self.import_statement_type.currentData() or "auto"
-        # 1. Instantiate the thread
-        # Important: Store it as a class attribute (self.thread) so it isn't garbage collected!
-        self.import_thread = PDFImportThread(files=files, ledger=self.gl, bank=bank, statement_type=statement_type,)
+        self.import_thread = PDFImportThread(files=files, ledger=self.gl, bank=bank, statement_type=statement_type)
 
-        # 2. Connect the signals to UI update methods
         self.import_thread.progress_signal.connect(self.update_status_bar)
         self.import_thread.finished_signal.connect(self.on_import_success)
         self.import_thread.error_signal.connect(self.on_import_error)
         self.import_thread.finished.connect(self.import_thread.deleteLater)
 
-        # 3. Start the thread
         self.btn_import_pdf.setEnabled(False)
         self.import_thread.start()
 
-        # Optional: Disable the import button here so the user doesn't spam it
-        # self.btn_import_pdf.setEnabled(False)
-
-    def update_status_bar(self, perecent: int, message: str):
-        """Updates UI status - runs on main thread safely."""
+    def update_status_bar(self, percent: int, message: str):
         self.statusBar().showMessage(message)
 
     def on_import_success(self, imported_count: int, review: dict):
-        """Handles the parsed data - runs on main thread safely."""
         self.btn_import_pdf.setEnabled(True)
 
         skipped = review.get("skipped_lines", [])
@@ -1785,13 +1539,10 @@ class BudgetApp(QMainWindow):
         self.refresh_overview()
 
     def on_import_error(self, error_message: str):
-        """Displays errors - runs on main thread safely."""
-        # self.btn_import_pdf.setEnabled(True)
         self.btn_import_pdf.setEnabled(True)
         QMessageBox.critical(self, "Import Error", error_message)
 
     def _init_sync_tab(self):
-        """Desktop UI for the ephemeral Cogni-Transfer LAN sync server."""
         layout = QVBoxLayout(self.tab_sync)
 
         server_box = QGroupBox("Mobile Sync")
@@ -1843,6 +1594,7 @@ class BudgetApp(QMainWindow):
         self.sync_last_cursor_label = QLabel("Last sync cursor: —")
         self.sync_accounts_label = QLabel("Unknown accounts: none")
         self.sync_held_label = QLabel("Held transactions: 0")
+
         for widget in (
             self.sync_handshake_label,
             self.sync_peer_label,
@@ -1890,7 +1642,6 @@ class BudgetApp(QMainWindow):
         self._resize_sync_qr()
 
     def _resize_sync_qr(self):
-        """Fit the QR code completely inside its available display area."""
         pixmap = getattr(self, "sync_qr_pixmap", None)
         if pixmap is None or pixmap.isNull():
             return
@@ -1901,7 +1652,6 @@ class BudgetApp(QMainWindow):
         height = max(1, available.height() - margin * 2)
         size = min(width, height)
 
-        # Keep the QR square and never scale it beyond the actual label.
         self.sync_qr_label.setPixmap(
             pixmap.scaled(
                 size,
@@ -1922,7 +1672,12 @@ class BudgetApp(QMainWindow):
 
         try:
             pairing_code = make_pairing_code()
-            server = CogniSyncServer(self.gl, pairing_code)
+            server = CogniSyncServer(
+                self.gl,
+                pairing_code,
+                on_sync_completed=lambda: self._create_safety_backup("post_sync")
+            )
+            self.sync_server = server
             thread = threading.Thread(
                 target=server.serve_forever,
                 name="CogniSyncServer",
@@ -1933,7 +1688,6 @@ class BudgetApp(QMainWindow):
             QMessageBox.critical(self, "Mobile Sync", f"Could not start the sync server:\n{e}")
             return
 
-        self.sync_server = server
         self.sync_thread = thread
         bootstrap = server.bootstrap_data
 
@@ -2001,20 +1755,13 @@ class BudgetApp(QMainWindow):
         else:
             self.sync_state_label.setText("Running — waiting for Android")
 
-        self.sync_handshake_label.setText(
-            f"Handshake: {'confirmed' if handshake else 'not confirmed'}"
-        )
+        self.sync_handshake_label.setText(f"Handshake: {'confirmed' if handshake else 'not confirmed'}")
         self.sync_peer_label.setText(f"Phone identity: {peer}")
         self.sync_last_cursor_label.setText(f"Last sync cursor: {cursor}")
-        self.sync_accounts_label.setText(
-            "Unknown accounts: " + (", ".join(unknown) if unknown else "none")
-        )
+        self.sync_accounts_label.setText("Unknown accounts: " + (", ".join(unknown) if unknown else "none"))
         self.sync_held_label.setText(f"Held transactions: {held}")
         self.sync_create_account_button.setEnabled(bool(unknown))
         self.sync_reprocess_button.setEnabled(held > 0)
-
-        if handshake and self.sync_state_label.text() == "Connected — handshake confirmed":
-            pass
 
     def create_sync_accounts(self):
         if self.sync_server is None:
@@ -2034,9 +1781,7 @@ class BudgetApp(QMainWindow):
                 type_combo.addItem(account_type)
             form.addRow("Account:", name_edit)
             form.addRow("Type:", type_combo)
-            buttons = QDialogButtonBox(
-                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-            )
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
             buttons.accepted.connect(dialog.accept)
             buttons.rejected.connect(dialog.reject)
             form.addRow(buttons)
@@ -2116,51 +1861,40 @@ class BudgetApp(QMainWindow):
         if not from_server:
             self._append_sync_log("Sync server stopped.")
 
-    def _run_silent_auto_backup(self):
-        """
-        Creates a timestamped encrypted backup in ~/BudgetData/backups/
-        and automatically prunes backups older than 7 days to prevent
-        disk bloat. Runs silently; if it fails, it logs a warning but
-        does NOT block the app from closing.
-        """
+    def _run_silent_auto_backup(self, trigger: str = "close"):
+        """Creates a timestamped encrypted backup in ~/BudgetData/backups/ and prunes backups older than 30 days."""
         try:
-            # Create a dedicated backups folder next to the main DB
             backup_dir = os.path.join(os.path.dirname(self.gl.db_path), "backups")
             os.makedirs(backup_dir, exist_ok=True)
 
-            # Generate a timestamped filename
             timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            backup_path = os.path.join(backup_dir, f"auto_backup_{timestamp}.db")
+            backup_path = os.path.join(backup_dir, f"auto_backup_{trigger}_{timestamp}.db")
 
-            # --- CRITICAL: Flush WAL to main DB before backing up ---
             self.gl.checkpoint()
-
-            # Call the existing ledger method directly!
             self.gl.create_encrypted_backup(backup_path)
 
-            # --- Prune old backups (keep last 7 days) ---
-            cutoff_time = time.time() - (30 * 86400)  # 7 days in seconds
+            cutoff_time = time.time() - (30 * 86400)
             for filename in os.listdir(backup_dir):
                 file_path = os.path.join(backup_dir, filename)
                 if os.path.isfile(file_path) and os.path.getmtime(file_path) < cutoff_time:
                     try:
                         os.remove(file_path)
                     except OSError:
-                        pass  # Best effort cleanup
+                        pass
         except Exception as e:
-            # CRITICAL: We catch everything here. If the backup fails
-            # (e.g., disk full, permissions issue), we just log it.
-            # We MUST NOT show a popup or raise an error here, because
-            # the user is trying to close the app and a popup would
-            # block the exit process.
-            import logging
-            logging.warning(f"Silent auto-backup on close failed: {e}")
+            logging.warning(f"Silent auto-backup on {trigger} failed: {e}")
+            self.notifications.add(
+                Severity.WARNING,
+                f"{trigger.replace('_', ' ').title()} Backup Failed",
+                f"CogniFinance could not create a safety backup. Your data is safe, "
+                f"but not backed up to disk. Error: {e}",
+                "backup_failure"
+            )
 
     def closeEvent(self, event):
-        # 1. Run the auto-backup BEFORE closing the DB connection
-        self._run_silent_auto_backup()
-
-        # 2. Shutdown mobile sync
+        if hasattr(self, 'test_manager'):
+            self.test_manager.cleanup()
+        self._run_silent_auto_backup("close")
         self.stop_mobile_sync()
         try:
             self.gl.close()
@@ -2178,13 +1912,7 @@ class BudgetApp(QMainWindow):
         self.rule_keyword.setPlaceholderText("e.g. T&T, STARBUCKS, GROCERY")
 
         self.rule_category = QComboBox()
-
-        expense_accounts = [
-            name
-            for name, acc in self.gl.accounts.items()
-            if acc.account_type == "Expense"
-        ]
-
+        expense_accounts = [name for name, acc in self.gl.accounts.items() if acc.account_type == "Expense"]
         for name in sorted(expense_accounts):
             self.rule_category.addItem(name, name)
 
@@ -2205,7 +1933,6 @@ class BudgetApp(QMainWindow):
         layout.addWidget(form_box)
 
         btn_row = QHBoxLayout()
-
         self.rule_edit_id = None
 
         btn_add = QPushButton("Add Rule")
@@ -2221,24 +1948,16 @@ class BudgetApp(QMainWindow):
         btn_row.addWidget(btn_update)
         btn_row.addWidget(btn_delete)
         btn_row.addStretch()
-
         layout.addLayout(btn_row)
 
         self.rules_table = QTableWidget()
         self.rules_table.setColumnCount(5)
-        self.rules_table.setHorizontalHeaderLabels(
-            ["ID", "Keyword", "Category", "Case", "Enabled"]
-        )
+        self.rules_table.setHorizontalHeaderLabels(["ID", "Keyword", "Category", "Case", "Enabled"])
 
-        self._setup_table_headers(
-            self.rules_table,
-            [0.08, 0.38, 0.32, 0.11, 0.11]
-        )
-
+        self._setup_table_headers(self.rules_table, [0.08, 0.38, 0.32, 0.11, 0.11])
         self.rules_table.itemSelectionChanged.connect(self.on_rule_selected)
 
         layout.addWidget(self.rules_table)
-
         self.refresh_rules_table()
 
     def refresh_rules_table(self):
@@ -2315,9 +2034,7 @@ class BudgetApp(QMainWindow):
             QMessageBox.warning(self, "Invalid rule", "Keyword and category are required.")
             return
 
-        ok, msg = self.gl.update_category_rule(
-            self.rule_edit_id, keyword, category, case_sensitive, enabled
-        )
+        ok, msg = self.gl.update_category_rule(self.rule_edit_id, keyword, category, case_sensitive, enabled)
         if ok:
             QMessageBox.information(self, "Rule updated", msg)
             self.refresh_rules_table()
@@ -2333,9 +2050,9 @@ class BudgetApp(QMainWindow):
             self,
             "Delete rule",
             "Are you sure you want to delete this rule?",
-            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
-        if reply != QMessageBox.Yes:
+        if reply != QMessageBox.StandardButton.Yes:
             return
 
         ok, msg = self.gl.delete_category_rule(self.rule_edit_id)
@@ -2348,41 +2065,55 @@ class BudgetApp(QMainWindow):
             QMessageBox.warning(self, "Rule error", msg)
 
     def edit_selected_transaction(self):
-        selected = self.tx_table2.selectedItems()
-        if not selected:
+        COL_ACCOUNT = 0
+        COL_DEBIT = 1
+        COL_CREDIT = 2
+        COL_LINEID = 3
+        COL_DELETE = 4
+
+        row = self.tx_table2.currentRow()
+        if row < 0:
             QMessageBox.information(self, "No selection", "Please select a transaction to edit.")
             return
 
-        row = selected[0].row()
         tx_id = self._tx_table_id_map.get(row)
-
         if tx_id is None:
             QMessageBox.warning(self, "Error", "Could not find transaction ID for selected row.")
             return
 
         tx = next((t for t in self.gl.transactions if t.id == tx_id), None)
-
-        if not tx:
+        if tx is None:
             QMessageBox.warning(self, "Error", "Transaction not found.")
             return
 
-        if len(tx.lines) != 2:
-            QMessageBox.warning(
-                self,
-                "Editing not supported",
-                "Only simple two-line transactions can be edited here.",
-            )
-            return
+        # Numeric delegate: constrains what characters CAN be typed into the
+        # cell (a keystroke-level input mask) -- this stays, since it's about
+        # the editing widget's behavior, not a business rule. Whatever ends
+        # up in the cell still goes to the ledger unvalidated by this dialog.
+        class _NumericDelegate(QStyledItemDelegate):
+            def createEditor(self, parent, option, index):
+                editor = QLineEdit(parent)
+                validator = QDoubleValidator(parent)
+                validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+                validator.setDecimals(10)
+                editor.setValidator(validator)
+                return editor
+
+            def setEditorData(self, editor, index):
+                val = index.model().data(index, Qt.ItemDataRole.DisplayRole)
+                editor.setText(str(val) if val is not None else "")
+
+            def setModelData(self, editor, model, index):
+                text = editor.text().strip()
+                model.setData(index, text, Qt.ItemDataRole.EditRole)
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Edit Transaction")
         dlg_layout = QVBoxLayout(dlg)
 
         form = QFormLayout()
-
         dlg_date = QDateEdit()
         dlg_date.setCalendarPopup(True)
-        from datetime import datetime
         try:
             dt = datetime.strptime(tx.date[:10], "%Y-%m-%d")
             dlg_date.setDate(QDate(dt.year, dt.month, dt.day))
@@ -2390,69 +2121,375 @@ class BudgetApp(QMainWindow):
             dlg_date.setDate(QDate.currentDate())
 
         dlg_desc = QLineEdit()
-        dlg_desc.setText(tx.description)
-
-        amount = Decimal("0.00")
-        acc_name = None
-        for line in tx.lines:
-            if line.dr > ZERO:
-                amount = line.dr
-                acc_name = line.account_name
-                break
-            if line.cr > ZERO:
-                amount = line.cr
-                acc_name = line.account_name
-                break
-
-        dlg_amount = QLineEdit()
-        dlg_amount.setText(f"{amount:.2f}")
-
+        dlg_desc.setText(tx.description or "")
         form.addRow("Date:", dlg_date)
         form.addRow("Description:", dlg_desc)
-        form.addRow("Account:", QLabel(acc_name or "(none)"))
-        form.addRow("Amount:", dlg_amount)
-
         dlg_layout.addLayout(form)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        lines_box = QGroupBox("Transaction Lines (Double-entry)")
+        lines_layout = QVBoxLayout(lines_box)
+
+        lines_table = QTableWidget()
+        lines_table.setColumnCount(5)
+        lines_table.setHorizontalHeaderLabels(["Account", "Debit", "Credit", "LineId", ""])
+        lines_table.setColumnHidden(COL_LINEID, True)
+        lines_table.setRowCount(0)
+        lines_table.setSortingEnabled(False)
+
+        num_delegate = _NumericDelegate(lines_table)
+        lines_table.setItemDelegateForColumn(COL_DEBIT, num_delegate)
+        lines_table.setItemDelegateForColumn(COL_CREDIT, num_delegate)
+
+        lines_layout.addWidget(lines_table)
+
+        # Totals: informational only -- see add_new_transaction for the same note.
+        totals_layout = QHBoxLayout()
+        totals_label = QLabel("Total Debit: 0.00    Total Credit: 0.00")
+        totals_layout.addWidget(totals_label)
+        totals_layout.addStretch()
+        lines_layout.addLayout(totals_layout)
+
+        account_names = sorted(self.gl.accounts.keys())
+
+        def create_account_combo(account_name=None):
+            combo = QComboBox()
+            for name in account_names:
+                combo.addItem(name, name)
+            if account_name is not None:
+                idx = combo.findData(account_name)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+            return combo
+
+        def create_amount_item(value):
+            item = QTableWidgetItem(str(value))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            return item
+
+        def create_line_row(account=None, debit="0.00", credit="0.00", line_id=""):
+            r = lines_table.rowCount()
+            lines_table.insertRow(r)
+
+            acc_combo = create_account_combo(account)
+            lines_table.setCellWidget(r, COL_ACCOUNT, acc_combo)
+
+            lines_table.setItem(r, COL_DEBIT, create_amount_item(debit))
+            lines_table.setItem(r, COL_CREDIT, create_amount_item(credit))
+
+            # line_id is the real sql_transaction_lines.id -- carried through
+            # so update_transaction can preserve it for the audit trail
+            # rather than reassigning a fresh id to every line on every edit.
+            line_id_item = QTableWidgetItem(str(line_id) if line_id not in (None, "") else "")
+            line_id_item.setFlags(line_id_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            lines_table.setItem(r, COL_LINEID, line_id_item)
+
+            del_btn = QPushButton("Delete")
+            def _on_delete():
+                sender = dlg.sender()
+                if sender is None:
+                    return
+                for rr in range(lines_table.rowCount()):
+                    if lines_table.cellWidget(rr, COL_DELETE) is sender:
+                        lines_table.removeRow(rr)
+                        _update_totals()
+                        return
+            del_btn.clicked.connect(_on_delete)
+            lines_table.setCellWidget(r, COL_DELETE, del_btn)
+
+        for line in tx.lines:
+            create_line_row(
+                account=line.account_name,
+                debit=line.dr,
+                credit=line.cr,
+                line_id=line.id
+            )
+
+        # A brand new row has no line_id, which is exactly what
+        # update_transaction needs to see to treat it as a new line rather
+        # than trying to match it against an existing one.
+        add_btn = QPushButton("Add Line")
+        def add_line():
+            create_line_row()
+            _update_totals()
+        add_btn.clicked.connect(add_line)
+        lines_layout.addWidget(add_btn)
+
+        dlg_layout.addWidget(lines_box)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
         dlg_layout.addWidget(buttons)
 
+        def _update_totals():
+            # Best-effort display only -- not a gate on Save.
+            total_dr = Decimal("0")
+            total_cr = Decimal("0")
+            for rr in range(lines_table.rowCount()):
+                dr_item = lines_table.item(rr, COL_DEBIT)
+                cr_item = lines_table.item(rr, COL_CREDIT)
+                for text, side in ((dr_item.text() if dr_item else "0", "dr"), (cr_item.text() if cr_item else "0", "cr")):
+                    try:
+                        val = Decimal(text.strip()) if text.strip() else Decimal("0")
+                    except Exception:
+                        val = Decimal("0")
+                    if side == "dr":
+                        total_dr += val
+                    else:
+                        total_cr += val
+            totals_label.setText(f"Total Debit: {format(total_dr, 'f')}    Total Credit: {format(total_cr, 'f')}")
+
+        lines_table.itemChanged.connect(lambda *_: _update_totals())
+        _update_totals()
+
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
+        # -------------------------
+        # Collect raw input and hand it straight to the ledger. No amount
+        # parsing, no balance check, no negative/zero check, no minimum-line
+        # count here -- update_transaction is the sole authority on all of
+        # that. The only things checked here are genuine UI-completeness
+        # concerns: did the dialog actually have a working account selector
+        # in every row.
+        # -------------------------
+        new_lines = []  # list of (line_id_or_None, account, dr_text, cr_text)
+        for i in range(lines_table.rowCount()):
+            acc_widget = lines_table.cellWidget(i, COL_ACCOUNT)
+            if acc_widget is None:
+                QMessageBox.warning(self, "Error", f"Row {i + 1} has no account selector -- this shouldn't happen.")
+                return
+
+            account = acc_widget.currentData()
+            if not account:
+                QMessageBox.warning(self, "No accounts available", "Create at least one account before editing transactions.")
+                return
+
+            dr_item = lines_table.item(i, COL_DEBIT)
+            cr_item = lines_table.item(i, COL_CREDIT)
+            line_id_item = lines_table.item(i, COL_LINEID)
+
+            dr_text = dr_item.text().strip() if dr_item is not None else "0"
+            cr_text = cr_item.text().strip() if cr_item is not None else "0"
+            line_id_text = line_id_item.text().strip() if line_id_item is not None else ""
+            line_id = int(line_id_text) if line_id_text else None
+
+            new_lines.append((line_id, account, dr_text, cr_text))
+
         new_date = dlg_date.date().toString("yyyy-MM-dd")
         new_desc = dlg_desc.text().strip()
-        new_amt_str = dlg_amount.text().strip()
-
-        try:
-            new_amt = Decimal(new_amt_str)
-            if new_amt <= 0:
-                raise ValueError()
-        except ValueError:
-            QMessageBox.warning(self, "Invalid amount", "Amount must be a positive number.")
-            return
-
-        new_lines = []
-        for line in tx.lines:
-            acc = self.gl.accounts[line.account_name]
-            if acc.account_type in ("Revenue", "Expense"):
-                if acc.account_type == "Revenue":
-                    new_lines.append((line.account_name, 0.0, new_amt))
-                else:
-                    new_lines.append((line.account_name, new_amt, 0.0))
-                break
-            else:
-                new_lines.append((line.account_name, line.dr, line.cr))
 
         ok, msg = self.gl.update_transaction(tx_id, new_date, new_desc, new_lines)
-        if ok:
-            QMessageBox.information(self, "Success", "Transaction updated.")
-            self.apply_transactions_tab_filters()
-            self.apply_transaction_filters()
-        else:
-            QMessageBox.warning(self, "Error", msg)
+        if not ok:
+            QMessageBox.warning(self, "Transaction Not Updated", msg)
+            return
+
+        QMessageBox.information(self, "Success", "Transaction updated.")
+        self.apply_transactions_tab_filters()
+        self.apply_transaction_filters()
+        self.refresh_overview()
+        self.refresh_accounts_table()
+
+    def add_new_transaction(self):
+
+        COL_ACCOUNT = 0
+        COL_DEBIT = 1
+        COL_CREDIT = 2
+        COL_DELETE = 3
+
+        # Numeric delegate: constrains what characters CAN be typed into the
+        # cell (a keystroke-level input mask), which is a different thing
+        # from validating the resulting value -- this stays, since it's
+        # about the editing widget's behavior, not a business rule. Whatever
+        # ends up in the cell still goes to the ledger unvalidated by this
+        # dialog; the ledger is what decides if it's actually acceptable.
+        class _NumericDelegate(QStyledItemDelegate):
+            def createEditor(self, parent, option, index):
+                editor = QLineEdit(parent)
+                validator = QDoubleValidator(parent)
+                validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+                validator.setDecimals(10)
+                editor.setValidator(validator)
+                return editor
+
+            def setEditorData(self, editor, index):
+                val = index.model().data(index, Qt.ItemDataRole.DisplayRole)
+                editor.setText(str(val) if val is not None else "")
+
+            def setModelData(self, editor, model, index):
+                text = editor.text().strip()
+                model.setData(index, text, Qt.ItemDataRole.EditRole)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Add Transaction")
+        dlg_layout = QVBoxLayout(dlg)
+
+        form = QFormLayout()
+        dlg_date = QDateEdit()
+        dlg_date.setCalendarPopup(True)
+        dlg_date.setDate(QDate.currentDate())
+
+        dlg_desc = QLineEdit()
+        form.addRow("Date:", dlg_date)
+        form.addRow("Description:", dlg_desc)
+        dlg_layout.addLayout(form)
+
+        lines_box = QGroupBox("Transaction Lines (Double-entry)")
+        lines_layout = QVBoxLayout(lines_box)
+
+        lines_table = QTableWidget()
+        lines_table.setColumnCount(4)
+        lines_table.setHorizontalHeaderLabels(["Account", "Debit", "Credit", ""])
+        lines_table.setRowCount(0)
+        lines_table.setSortingEnabled(False)
+
+        num_delegate = _NumericDelegate(lines_table)
+        lines_table.setItemDelegateForColumn(COL_DEBIT, num_delegate)
+        lines_table.setItemDelegateForColumn(COL_CREDIT, num_delegate)
+
+        lines_layout.addWidget(lines_table)
+
+        # Totals: informational only, purely a live readout for the user's
+        # own benefit while filling the form -- has no bearing on whether
+        # Save succeeds, so a best-effort display (falling back to 0 on
+        # anything unparseable) is fine here in a way it wouldn't be if this
+        # fed into validation.
+        totals_layout = QHBoxLayout()
+        totals_label = QLabel("Total Debit: 0.00    Total Credit: 0.00")
+        totals_layout.addWidget(totals_label)
+        totals_layout.addStretch()
+        lines_layout.addLayout(totals_layout)
+
+        account_names = sorted(self.gl.accounts.keys())
+
+        def create_account_combo(account_name=None):
+            combo = QComboBox()
+            for name in account_names:
+                combo.addItem(name, name)
+            if account_name is not None:
+                idx = combo.findData(account_name)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+            return combo
+
+        def create_amount_item(value):
+            item = QTableWidgetItem(str(value))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            return item
+
+        def create_line_row(account=None, debit="0.00", credit="0.00"):
+            r = lines_table.rowCount()
+            lines_table.insertRow(r)
+
+            acc_combo = create_account_combo(account)
+            lines_table.setCellWidget(r, COL_ACCOUNT, acc_combo)
+
+            lines_table.setItem(r, COL_DEBIT, create_amount_item(debit))
+            lines_table.setItem(r, COL_CREDIT, create_amount_item(credit))
+
+            del_btn = QPushButton("Delete")
+            def _on_delete():
+                sender = dlg.sender()
+                if sender is None:
+                    return
+                for rr in range(lines_table.rowCount()):
+                    if lines_table.cellWidget(rr, COL_DELETE) is sender:
+                        lines_table.removeRow(rr)
+                        _update_totals()
+                        return
+            del_btn.clicked.connect(_on_delete)
+            lines_table.setCellWidget(r, COL_DELETE, del_btn)
+
+        create_line_row()
+        create_line_row()
+
+        add_btn = QPushButton("Add Line")
+        def add_line():
+            create_line_row()
+            _update_totals()
+        add_btn.clicked.connect(add_line)
+        lines_layout.addWidget(add_btn)
+
+        dlg_layout.addWidget(lines_box)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        dlg_layout.addWidget(buttons)
+
+        def _update_totals():
+            # Best-effort display only -- see note above. Not a gate on Save.
+            total_dr = Decimal("0")
+            total_cr = Decimal("0")
+            for rr in range(lines_table.rowCount()):
+                dr_item = lines_table.item(rr, COL_DEBIT)
+                cr_item = lines_table.item(rr, COL_CREDIT)
+                for text, side in ((dr_item.text() if dr_item else "0", "dr"), (cr_item.text() if cr_item else "0", "cr")):
+                    try:
+                        val = Decimal(text.strip()) if text.strip() else Decimal("0")
+                    except Exception:
+                        val = Decimal("0")
+                    if side == "dr":
+                        total_dr += val
+                    else:
+                        total_cr += val
+            totals_label.setText(f"Total Debit: {format(total_dr, 'f')}    Total Credit: {format(total_cr, 'f')}")
+
+        lines_table.itemChanged.connect(lambda *_: _update_totals())
+        _update_totals()
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        # -------------------------
+        # Collect raw input and hand it straight to the ledger. No amount
+        # parsing, no balance check, no negative/zero check, no minimum-line
+        # count here -- record_transaction is the sole authority on all of
+        # that, and handles bad input (unparseable text, NaN/Infinity, too
+        # few lines) gracefully with a clear message. The only things
+        # checked here are genuine UI-completeness concerns: did the dialog
+        # actually have a working account selector in every row.
+        # -------------------------
+        lines_data = []
+        for i in range(lines_table.rowCount()):
+            acc_widget = lines_table.cellWidget(i, COL_ACCOUNT)
+            if acc_widget is None:
+                QMessageBox.warning(self, "Error", f"Row {i + 1} has no account selector -- this shouldn't happen.")
+                return
+
+            account = acc_widget.currentData()
+            if not account:
+                # Only reachable if the ledger currently has zero accounts to
+                # choose from -- worth a clear message immediately rather
+                # than a confusing round-trip for something this basic.
+                QMessageBox.warning(self, "No accounts available", "Create at least one account before adding transactions.")
+                return
+
+            dr_item = lines_table.item(i, COL_DEBIT)
+            cr_item = lines_table.item(i, COL_CREDIT)
+            dr_text = dr_item.text().strip() if dr_item is not None else "0"
+            cr_text = cr_item.text().strip() if cr_item is not None else "0"
+
+            lines_data.append((account, dr_text, cr_text))
+
+        new_date = dlg_date.date().toString("yyyy-MM-dd")
+        new_desc = dlg_desc.text().strip()
+
+        ok, msg = self.gl.record_transaction(new_date, new_desc, lines_data)
+        if not ok:
+            QMessageBox.warning(self, "Transaction Not Added", msg)
+            return
+
+        QMessageBox.information(self, "Success", "Transaction added.")
+        self.apply_transactions_tab_filters()
+        self.apply_transaction_filters()
+        self.refresh_overview()
+        self.refresh_accounts_table()
+
 
     def delete_selected_transaction(self):
         selected = self.tx_table2.selectedItems()
@@ -2466,7 +2503,7 @@ class BudgetApp(QMainWindow):
             "Are you sure you want to delete this transaction?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
-        if reply != QMessageBox.Yes:
+        if reply != QMessageBox.StandardButton.Yes:
             return
 
         row = selected[0].row()

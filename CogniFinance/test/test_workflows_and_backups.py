@@ -1,7 +1,10 @@
 import os
+import sys
 import tempfile
 import pytest
 from decimal import Decimal
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ledger import GeneralLedger
 

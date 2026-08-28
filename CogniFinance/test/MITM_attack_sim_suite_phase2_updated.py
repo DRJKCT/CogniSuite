@@ -35,7 +35,7 @@ import time
 import threading
 import re
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # The Phase 2 suite must test the current source files beside this script.
 # No historical/revisioned copies are searched for or accepted.
@@ -56,7 +56,7 @@ if _missing:
         + ", ".join(_missing)
     )
 
-sys.path.insert(0, BASE_DIR)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from protocol import (
     PROTOCOL,

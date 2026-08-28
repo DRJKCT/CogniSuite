@@ -4,10 +4,13 @@ protocol: payload validation, balance enforcement, backward compatibility
 with the legacy 2-line format, and end-to-end posting into the ledger.
 """
 import os
+import sys
 import shutil
 import tempfile
 import unittest
 from decimal import Decimal
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from protocol import DesktopLedger, parse_amount_strict, PairingError
 from desktop_sync_server import (

@@ -12,10 +12,14 @@ Tests for the bug fixes made after the initial protocol review:
 6. HKDF-based session key derivation (was a bare SHA256 concatenation)
 """
 import os
+import sys
 import shutil
 import tempfile
 import unittest
 import uuid
+import copy
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from protocol import (
     DesktopLedger,
@@ -105,7 +109,7 @@ class TestVerifyTransactionAmounts(unittest.TestCase):
         ok, reason = self.dl.verify_transaction(self._tx("54.23"))
         self.assertTrue(ok)
 
-    def test_split_transaction_conflict_detection():
+def test_split_transaction_conflict_detection():
     """
     If a split transaction is resent with the SAME ID but DIFFERENT splits,
     the DesktopLedger must flag it as a conflict, not silently accept it

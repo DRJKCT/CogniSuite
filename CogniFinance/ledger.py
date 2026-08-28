@@ -1,8 +1,9 @@
 import os
+import glob
 import json
 import logging
 import re
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -48,6 +49,12 @@ class TransactionLine:
     account_name: str
     dr: Decimal = ZERO
     cr: Decimal = ZERO
+    id: Optional[int] = None  # the sql_transaction_lines.id, when known --
+                               # None for a line that doesn't exist in the
+                               # DB yet (e.g. a brand-new line in an edit,
+                               # or any line from record_transaction's
+                               # plain 3-tuple input, which never had one
+                               # to begin with).
 
 
 @dataclass
@@ -75,10 +82,14 @@ _ILLEGAL_XML_RE = re.compile(
     r'\ud800-\udfff\ufdd0-\ufdef\ufffe\uffff]'
 )
 
+_FORMULA_INJECTION_CHARS = ('+', '-', '=', '@')
+
 def _sanitize_for_excel(value):
     """Strips illegal XML control characters from strings to prevent openpyxl crashes."""
     if isinstance(value, str):
         return _ILLEGAL_XML_RE.sub('', value)
+        if value and value[0] in _FORMULA_INJECTION_CHARS:
+            value = "'" + value
     return value
 
 
@@ -219,8 +230,8 @@ class GeneralLedger:
 
             cur.execute("SELECT id, date, description, imported_id, reconciled FROM sql_transactions ORDER BY date")
             for tx_id, date, desc, imp_id, rec in cur.fetchall():
-                cur.execute("SELECT account_name, dr, cr FROM sql_transaction_lines WHERE tx_id = ?", (tx_id,))
-                lines = [TransactionLine(acc_name, money(dr) if dr else ZERO, money(cr) if cr else ZERO) for acc_name, dr, cr in cur.fetchall()]
+                cur.execute("SELECT id, account_name, dr, cr FROM sql_transaction_lines WHERE tx_id = ?", (tx_id,))
+                lines = [TransactionLine(acc_name, money(dr) if dr else ZERO, money(cr) if cr else ZERO, id=line_id) for line_id, acc_name, dr, cr in cur.fetchall()]
                 tx = Transaction(tx_id, date, desc, lines, imp_id, bool(rec))
                 self._apply_transaction_to_accounts(tx)
                 self.transactions.append(tx)
@@ -263,6 +274,39 @@ class GeneralLedger:
             return cur.fetchone() is not None
         finally:
             conn.close()
+
+    def create_hot_backup(self, backup_dir: str, keep_last: int = 5) -> Tuple[bool, str]:
+        """
+        Creates a safe, point-in-time backup of the encrypted database
+        using SQLCipher's VACUUM INTO. Safe to run while the app is active.
+        """
+
+        os.makedirs(backup_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = os.path.join(backup_dir, f"ledger_backup_{timestamp}.db")
+
+        conn, cur = self._connect()
+        try:
+
+            cur.execute("VACUUM INTO ?", (backup_path,))
+            conn.commit()
+
+            # Prune old backups to prevent the folder from consuming all disk space
+            files = glob.glob(os.path.join(backup_dir, "ledger_backup_*.db"))
+            files.sort(key=os.path.getctime, reverse=True)
+            for old_file in files[keep_last:]:
+                try:
+                    os.remove(old_file)
+                except OSError:
+                    pass
+
+            return True, backup_path
+        except Exception as e:
+            logger.error(f"Hot backup failed: {e}")
+            return False, str(e)
+        finally:
+            if conn is not self._main_conn:
+                conn.close()
 
 
     def begin_transaction(self) -> None:
@@ -367,7 +411,29 @@ class GeneralLedger:
             msg = "Invalid date format. Use YYYY-MM-DD."
             logger.warning(f"Ledger rejected transaction '{description}': {msg}")
             return False, msg
-        lines = [TransactionLine(acc, money(dr), money(cr)) for acc, dr, cr in lines_data]
+
+        if len(lines_data) < 2:
+            msg = "A transaction must contain at least two lines."
+            logger.warning(f"Ledger rejected transaction '{description}': {msg}")
+            return False, msg
+
+        try:
+            lines = [TransactionLine(acc, money(dr), money(cr)) for acc, dr, cr in lines_data]
+            for line in lines:
+                if not line.dr.is_finite() or not line.cr.is_finite():
+                    raise ValueError(f"non-finite amount on account '{line.account_name}'")
+        except (InvalidOperation, ValueError, TypeError) as e:
+            # Previously uncaught here -- a garbage amount string raised
+            # InvalidOperation at parse time, but NaN/Infinity are
+            # different: they parse into a valid Decimal successfully and
+            # only blow up LATER on the first comparison (line.dr < ZERO
+            # below), which is a much nastier failure mode since the
+            # traceback points at an unrelated line, not the bad input.
+            # The explicit is_finite() check above catches both cases
+            # here, in one place, before either can happen.
+            msg = f"Invalid amount: {e}"
+            logger.warning(f"Ledger rejected transaction '{description}': {msg}")
+            return False, msg
 
         for line in lines:
             if line.dr < ZERO or line.cr < ZERO:
@@ -423,16 +489,19 @@ class GeneralLedger:
     def _lines_to_json(lines) -> str:
         """
         Serialize transaction lines (list of TransactionLine, or of
-        (account_name, dr, cr) tuples) into a JSON string for storage in
-        the history table.
+        (line_id, account_name, dr, cr) tuples) into a JSON string for
+        storage in the history table. line_id is included so history
+        entries can document WHICH specific line changed in a
+        multi-line/split transaction, not just that the transaction
+        changed somehow.
         """
         payload = []
         for line in lines:
             if isinstance(line, TransactionLine):
-                payload.append({"account_name": line.account_name, "dr": str(line.dr), "cr": str(line.cr)})
+                payload.append({"id": line.id, "account_name": line.account_name, "dr": str(line.dr), "cr": str(line.cr)})
             else:
-                acc, dr, cr = line
-                payload.append({"account_name": acc, "dr": str(money(dr)), "cr": str(money(cr))})
+                line_id, acc, dr, cr = line
+                payload.append({"id": line_id, "account_name": acc, "dr": str(money(dr)), "cr": str(money(cr))})
         return json.dumps(payload)
 
     def _log_history(self, cur, tx_id: Optional[int], change_type: str, date: str, description: str, lines) -> None:
@@ -455,14 +524,15 @@ class GeneralLedger:
         )
 
     def _fetch_transaction_snapshot(self, cur, tx_id: int):
-        """Read a transaction's current (date, description, lines) directly from the DB."""
+        """Read a transaction's current (date, description, lines) directly
+        from the DB. lines is a list of (line_id, account_name, dr, cr)."""
         cur.execute("SELECT date, description FROM sql_transactions WHERE id = ?", (tx_id,))
         row = cur.fetchone()
         if row is None:
             return None
         date, description = row
-        cur.execute("SELECT account_name, dr, cr FROM sql_transaction_lines WHERE tx_id = ?", (tx_id,))
-        lines = [(acc, money(dr) if dr else ZERO, money(cr) if cr else ZERO) for acc, dr, cr in cur.fetchall()]
+        cur.execute("SELECT id, account_name, dr, cr FROM sql_transaction_lines WHERE tx_id = ?", (tx_id,))
+        lines = [(line_id, acc, money(dr) if dr else ZERO, money(cr) if cr else ZERO) for line_id, acc, dr, cr in cur.fetchall()]
         return date, description, lines
 
     def _persist_transaction(self, tx: Transaction):
@@ -981,22 +1051,51 @@ class GeneralLedger:
             amount=amount
         )
 
-    def update_transaction(self, tx_id: int, new_date: str, new_description: str, new_lines: List[Tuple[str, Any, Any]]) -> Tuple[bool, str]:
-        lines = [TransactionLine(acc, money(dr), money(cr)) for acc, dr, cr in new_lines]
+    def update_transaction(self, tx_id: int, new_date: str, new_description: str, new_lines: List[Tuple[Optional[int], str, Any, Any]]) -> Tuple[bool, str]:
+        """
+        new_lines: list of (line_id, account_name, dr, cr).
+        line_id is the existing sql_transaction_lines.id to preserve --
+        pass None for a newly added line (it gets a fresh id on insert).
 
-        for line in lines:
-            if line.dr < ZERO or line.cr < ZERO:
+        This preserves ids for lines that already existed (matched by id,
+        updated in place) rather than deleting and reinserting every line
+        on every edit -- the previous implementation reassigned a brand
+        new id to every single line on every edit, even ones the user
+        never touched, which made it impossible for the audit trail to
+        show which specific line in a split transaction actually changed.
+
+        Any existing line whose id is NOT present in new_lines is treated
+        as removed by this edit and deleted. Any incoming id that doesn't
+        belong to this transaction at all is rejected outright, rather
+        than silently ignored -- accepting it could let a caller (however
+        unintentionally) edit a line that actually belongs to a different
+        transaction.
+        """
+        if len(new_lines) < 2:
+            return False, "A transaction must contain at least two lines."
+
+        parsed = []
+        try:
+            for line_id, acc, dr, cr in new_lines:
+                dr_val, cr_val = money(dr), money(cr)
+                if not dr_val.is_finite() or not cr_val.is_finite():
+                    raise ValueError(f"non-finite amount on account '{acc}'")
+                parsed.append((line_id, acc, dr_val, cr_val))
+        except (InvalidOperation, ValueError, TypeError) as e:
+            return False, f"Invalid amount: {e}"
+
+        for line_id, acc, dr, cr in parsed:
+            if dr < ZERO or cr < ZERO:
                 return False, "Negative debits or credits are not allowed."
-            if line.dr > ZERO and line.cr > ZERO:
+            if dr > ZERO and cr > ZERO:
                 return False, "A transaction line cannot contain both a debit and a credit."
-            if line.dr == ZERO and line.cr == ZERO:
+            if dr == ZERO and cr == ZERO:
                 return False, "A transaction line must contain either a debit or a credit."
-            if line.account_name not in self.accounts:
-                return False, f"Account '{line.account_name}' does not exist."
+            if acc not in self.accounts:
+                return False, f"Account '{acc}' does not exist."
 
-        total_dr = sum((l.dr for l in lines), ZERO)
-        total_cr = sum((l.cr for l in lines), ZERO)
-
+        total_dr = sum((dr for _, _, dr, _ in parsed), ZERO)
+        total_cr = sum((cr for _, _, _, cr in parsed), ZERO)
         if total_dr != total_cr:
             return False, "Transaction out of balance."
 
@@ -1010,11 +1109,37 @@ class GeneralLedger:
             cur.execute("UPDATE sql_transactions SET date = ?, description = ? WHERE id = ?", (new_date, new_description, tx_id))
             if cur.rowcount == 0:
                 return False, "Transaction not found."
-            cur.execute("DELETE FROM sql_transaction_lines WHERE tx_id = ?", (tx_id,))
-            for line in lines:
-                cur.execute("INSERT INTO sql_transaction_lines (tx_id, account_name, dr, cr) VALUES (?, ?, ?, ?)", (tx_id, line.account_name, str(line.dr), str(line.cr)))
+
+            cur.execute("SELECT id FROM sql_transaction_lines WHERE tx_id = ?", (tx_id,))
+            existing_ids = {row[0] for row in cur.fetchall()}
+
+            incoming_ids = {line_id for line_id, _, _, _ in parsed if line_id is not None}
+            foreign_ids = incoming_ids - existing_ids
+            if foreign_ids:
+                conn.rollback()
+                return False, f"Line id(s) {sorted(foreign_ids)} do not belong to this transaction."
+
+            removed_ids = existing_ids - incoming_ids
+            if removed_ids:
+                placeholders = ",".join("?" for _ in removed_ids)
+                cur.execute(f"DELETE FROM sql_transaction_lines WHERE id IN ({placeholders})", list(removed_ids))
+
+            for line_id, acc, dr, cr in parsed:
+                if line_id is not None:
+                    cur.execute(
+                        "UPDATE sql_transaction_lines SET account_name = ?, dr = ?, cr = ? WHERE id = ? AND tx_id = ?",
+                        (acc, str(dr), str(cr), line_id, tx_id),
+                    )
+                else:
+                    cur.execute(
+                        "INSERT INTO sql_transaction_lines (tx_id, account_name, dr, cr) VALUES (?, ?, ?, ?)",
+                        (tx_id, acc, str(dr), str(cr)),
+                    )
+
             # Log the state as it was *before* this update, so history
-            # reads as a trail of prior versions.
+            # reads as a trail of prior versions -- now including each
+            # line's id, so a split transaction's history documents
+            # exactly which line changed, not just that something did.
             self._log_history(cur, tx_id, "updated", old_date, old_description, old_lines)
             conn.commit()
         except Exception as e:
@@ -1046,6 +1171,115 @@ class GeneralLedger:
             conn.close()
         self._load_from_db()
         return True, "Transaction deleted."
+
+    def reassign_account(
+        self,
+        old_account: str,
+        new_account: str,
+        imported_only: bool = True,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Bulk-move every transaction LINE currently posted to `old_account`
+        over to `new_account`. Relabels the account only -- debit/credit
+        values are left exactly as they were.
+
+        Built for the "QFX import landed everything in the wrong account"
+        case: editing hundreds of misfiled transactions one at a time via
+        update_transaction() is impractical, and there was previously no
+        way to fix a bad import short of deleting it entirely.
+
+        IMPORTANT -- this does NOT and should NOT try to "fix" debit/credit
+        direction. An earlier version of this method had a flip_dr_cr
+        option; it's been removed after testing showed it corrupts the
+        ledger. Flipping one line's dr/cr without symmetrically adjusting
+        the transaction's OTHER line breaks the balance invariant outright
+        (total dr must equal total cr WITHIN each transaction, not just
+        across the whole ledger). Beyond that bug, whether a line's
+        direction is even "wrong" depends on whether that specific
+        transaction was a deposit or a withdrawal -- a blanket batch-level
+        flip can't know that, and would get roughly half of any mixed
+        batch backwards.
+
+        If some of the misfiled transactions also have the wrong
+        debit/credit direction (check this against the real statement --
+        an account should be debited when money entered it and credited
+        when money left, regardless of the account's type label), fix
+        those specific transactions individually with update_transaction(),
+        which validates balance on every call. Use THIS method only to
+        correct the account label in bulk; use that one for anything
+        needing a direction correction.
+
+        imported_only=True (the default) restricts this to lines whose
+        parent transaction has a non-null imported_id, so a bad import
+        can be corrected without also touching manually-entered
+        transactions that happen to share the same (correct) account
+        name. Pass False to widen it if you actually want everything.
+
+        date_from/date_to (inclusive, "YYYY-MM-DD") let you scope to a
+        specific statement's date range if imported_only alone isn't
+        precise enough.
+
+        Every affected transaction gets a normal "updated" history entry
+        (old state logged before the change), exactly like a manual edit
+        through update_transaction() would -- this is a bulk *edit*, not
+        a special bypass of the audit trail.
+        """
+        if new_account not in self.accounts:
+            return False, f"Account '{new_account}' does not exist."
+        if old_account == new_account:
+            return False, "Old and new account are the same; nothing to do."
+
+        conn, cur = self._connect()
+        try:
+            query = (
+                "SELECT DISTINCT stl.tx_id FROM sql_transaction_lines stl "
+                "JOIN sql_transactions st ON st.id = stl.tx_id "
+                "WHERE stl.account_name = ?"
+            )
+            params: list = [old_account]
+            if imported_only:
+                query += " AND st.imported_id IS NOT NULL"
+            if date_from:
+                query += " AND st.date >= ?"
+                params.append(date_from)
+            if date_to:
+                query += " AND st.date <= ?"
+                params.append(date_to)
+
+            cur.execute(query, params)
+            tx_ids = [row[0] for row in cur.fetchall()]
+
+            if not tx_ids:
+                return True, f"No matching transactions found on '{old_account}'; nothing changed."
+
+            for tx_id in tx_ids:
+                snapshot = self._fetch_transaction_snapshot(cur, tx_id)
+                if snapshot is None:
+                    continue  # shouldn't happen given the JOIN above, but stay defensive
+                old_date, old_description, old_lines = snapshot
+                self._log_history(cur, tx_id, "updated", old_date, old_description, old_lines)
+
+            id_placeholders = ",".join("?" for _ in tx_ids)
+            cur.execute(
+                "UPDATE sql_transaction_lines SET account_name = ? "
+                "WHERE account_name = ? AND tx_id IN ({})".format(id_placeholders),
+                [new_account, old_account] + tx_ids,
+            )
+            affected_lines = cur.rowcount
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+        finally:
+            conn.close()
+
+        self._load_from_db()
+        return True, (
+            f"Reassigned {affected_lines} line(s) across {len(tx_ids)} transaction(s) "
+            f"from '{old_account}' to '{new_account}'."
+        )
 
     def monthly_income_expense_report(self, year: int, month: int) -> Dict[str, Any]:
         start = f"{year:04d}-{month:02d}-01"

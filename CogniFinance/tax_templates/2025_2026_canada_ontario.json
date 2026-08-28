@@ -1,0 +1,49 @@
+{
+    "title": "Canada (Ontario) 2025/2026",
+    "description": "Federal + Ontario provincial tax rates for 2025/2026 tax year",
+    "tax_year": "2025-2026",
+    "jurisdiction": "CA-ON",
+
+    "federal_brackets": [
+        {"threshold": 57375, "rate": 0.145},
+        {"threshold": 114750, "rate": 0.205},
+        {"threshold": 177882, "rate": 0.26},
+        {"threshold": 253414, "rate": 0.29},
+        {"threshold": 999999999, "rate": 0.33}
+    ],
+
+    "provincial_brackets": [
+        {"threshold": 52886, "rate": 0.0505},
+        {"threshold": 105775, "rate": 0.0915},
+        {"threshold": 150000, "rate": 0.1116},
+        {"threshold": 220000, "rate": 0.1216},
+        {"threshold": 999999999, "rate": 0.1316}
+    ],
+
+    "provincial_name": "Ontario",
+
+    "cpp": {
+        "basic_max": 71300,
+        "basic_exempt": 3500,
+        "basic_rate": 0.119,
+        "cpp2_max": 79500,
+        "cpp2_threshold": 71300,
+        "cpp2_rate": 0.08
+    },
+
+    "ontario_health_premium": [
+        {"min_income": 200000, "premium": 900},
+        {"min_income": 150000, "premium": 750},
+        {"min_income": 100000, "premium": 600},
+        {"min_income": 72000, "premium": 450},
+        {"min_income": 48000, "premium": 300},
+        {"min_income": 0, "premium": 0}
+    ],
+
+    "credits": {
+        "federal_basic_personal_amount": 16129,
+        "federal_lowest_rate": 0.145,
+        "provincial_basic_personal_amount": 12399,
+        "provincial_lowest_rate": 0.0505
+    }
+}

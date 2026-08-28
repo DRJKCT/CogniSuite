@@ -1,5 +1,10 @@
 # test_protocol_equivalence.py
 import unittest
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from decimal import Decimal
 from protocol import DesktopLedger, parse_amount_strict
 

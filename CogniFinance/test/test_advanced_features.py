@@ -1,7 +1,10 @@
 import os
+import sys
 import tempfile
 import pytest
 from decimal import Decimal
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ledger import GeneralLedger
 from passphrase_recovery import (
@@ -11,6 +14,8 @@ from passphrase_recovery import (
     delete_recovery_escrow,
     generate_recovery_passphrase
 )
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ==========================================
 # 1. REKEY DATA STABILITY

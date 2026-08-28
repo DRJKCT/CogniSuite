@@ -1,6 +1,14 @@
 import pytest
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from crypto_utils import encrypt_string_with_passphrase, decrypt_string_with_passphrase
 from passphrase_recovery import estimate_strength, generate_recovery_passphrase
+
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ==========================================
 # 1. CRYPTO ROUNDTRIPS

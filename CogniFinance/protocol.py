@@ -18,6 +18,8 @@ def canonical_json(o): return json.dumps(o,sort_keys=True,separators=(',',':'),e
 def payload_hash(o): return hashlib.sha256(canonical_json(o)).hexdigest()
 def envelope(message_type,session_id,device_id,payload): return {'protocol':PROTOCOL,'version':VERSION,'message_type':message_type,'session_id':session_id,'message_id':str(uuid.uuid4()),'device_id':device_id,'timestamp':now_iso(),'payload':payload}
 
+APP_DATA_DIR = os.environ.get("COGNIFINANCE_DATA_DIR", os.path.expanduser("~/BudgetData"))
+
 #Protocol ver. 0.4 Debug
 
 class ReplayGuard:
@@ -431,7 +433,7 @@ class PairingError(Exception):
     limiter is currently locked out."""
 
 
-DEFAULT_PAIRING_LOCKOUT_PATH = os.path.join(os.path.expanduser("~"), ".cognibudget_pairing_lockout.json")
+DEFAULT_PAIRING_LOCKOUT_PATH = os.path.join(APP_DATA_DIR, ".cognifinance_pairing_lockout.json")
 
 
 class PairingAttemptLimiter:
@@ -632,8 +634,8 @@ def identity_fingerprint(public_key_bytes: bytes) -> str:
     return hashlib.sha256(public_key_bytes).hexdigest()[:16]
 
 
-DEFAULT_TRUST_STORE_PATH = os.path.join(os.path.expanduser("~"), ".cognibudget_trusted_devices.json")
-DEFAULT_IDENTITY_PATH = os.path.join(os.path.expanduser("~"), ".cognibudget_sync_identity.key")
+DEFAULT_TRUST_STORE_PATH = os.path.join(APP_DATA_DIR, ".cognifinance_trusted_devices.json")
+DEFAULT_IDENTITY_PATH = os.path.join(APP_DATA_DIR, ".cognifinance_sync_identity.key")
 
 
 class TrustStore:

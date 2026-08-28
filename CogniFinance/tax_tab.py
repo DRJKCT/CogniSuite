@@ -47,6 +47,15 @@ class TaxTab(QWidget):
             self.combo_tax_template.addItem(t_data.get("title", t_id), userData=t_id)
         self.combo_tax_template.currentIndexChanged.connect(self.refresh_summary)
 
+        # ==========================================
+        # 2. NEW: Tax Rates / Year Selector (JSON)
+        # ==========================================
+        self.tax_year_combo = QComboBox()
+        self._refresh_tax_year_dropdown() # Populate it with JSON files
+        self.tax_year_combo.currentIndexChanged.connect(self.refresh_summary)
+        rlayout.addRow("Tax Rates/Year:", self.tax_year_combo)
+        # ==========================================
+
         today = QDate.currentDate()
         self.tax_start = QDateEdit()
         self.tax_start.setCalendarPopup(True)
@@ -66,8 +75,20 @@ class TaxTab(QWidget):
 
         # --- Action Buttons ---
         btn_row = QHBoxLayout()
+
         btn_export = QPushButton("Export Tax Report (XLSX)")
         btn_export.clicked.connect(self.export_report)
+
+        year_layout = QHBoxLayout()
+        year_layout.addWidget(QLabel("Tax Year / Jurisdiction:"))
+
+        self.tax_year_combo = QComboBox()
+        self._refresh_tax_year_dropdown() # Populate it on startup
+        year_layout.addWidget(self.tax_year_combo, stretch=1)
+
+        # Connect it so the summary recalculates when the user changes the year
+        self.tax_year_combo.currentIndexChanged.connect(self.refresh_summary)
+
 
         btn_add_template = QPushButton("Add Template Section")
         btn_add_template.clicked.connect(self.add_dynamic_section)
@@ -169,7 +190,12 @@ class TaxTab(QWidget):
 
         # Tax Liability Section
         if net > Decimal("0.00"):
-            est = estimate_tax_liability(net)
+
+            selected_template = "2025_2026_canada_ontario"
+            if hasattr(self, 'tax_year_combo'):
+                selected_template = self.tax_year_combo.currentData() or selected_template
+
+            est = estimate_tax_liability(net, tax_year=selected_template)
             html.append("<br><br>")
             html.append("<b>ESTIMATED TAX LIABILITY (T2125)</b><br>")
             html.append("<hr>")
@@ -343,3 +369,15 @@ class TaxTab(QWidget):
                     mapped_cats[item] = [item]
             return mapped_cats
         return {}
+    def _refresh_tax_year_dropdown(self):
+        """Populate the tax year selector with available JSON templates."""
+        from tax_calculator import get_available_tax_templates
+
+        self.tax_year_combo.clear()
+        templates = get_available_tax_templates()
+
+        # Sort them so the newest years appear at the top
+        for template in sorted(templates, reverse=True):
+            # Make it look pretty in the dropdown (e.g., "2025 2026 Canada Ontario")
+            display_name = template.replace("_", " ").title()
+            self.tax_year_combo.addItem(display_name, template)

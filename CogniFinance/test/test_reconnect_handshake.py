@@ -13,6 +13,9 @@ import shutil
 import tempfile
 import unittest
 import uuid
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import protocol
 from protocol import (

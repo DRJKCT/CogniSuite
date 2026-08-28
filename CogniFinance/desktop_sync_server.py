@@ -91,6 +91,8 @@ from protocol import (
 )
 from ledger import GeneralLedger, money
 
+APP_DATA_DIR = os.environ.get("COGNIFINANCE_DATA_DIR", os.path.expanduser("~/BudgetData"))
+
 # Optional dependency for LAN IP enumeration; the module still loads without it.
 try:
     import netifaces
@@ -101,7 +103,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_LOG_PATH = os.path.join(os.path.expanduser("~"), ".cognibudget_sync.log")
+DEFAULT_LOG_PATH = os.path.join(APP_DATA_DIR, ".cognifinance_sync.log")
 
 
 def configure_file_logging(path: str = DEFAULT_LOG_PATH, level: int = logging.INFO) -> None:
@@ -150,7 +152,7 @@ def configure_file_logging(path: str = DEFAULT_LOG_PATH, level: int = logging.IN
 # --- Tunables ----------------------------------------------------------------
 MAX_REQUEST_SIZE = 10 * 1024 * 1024      # 10 MB request cap
 READ_TIMEOUT_SECONDS = 30                # per-request socket read timeout
-DEFAULT_PAIRED_PHONE_PATH = os.path.join(os.path.expanduser("~"), ".cognibudget_paired_phone.json")
+DEFAULT_PAIRED_PHONE_PATH = os.path.join(APP_DATA_DIR, ".cognifinance_paired_phone.json")
 
 # --- Phone-safe response strings ---------------------------------------------
 # SECURITY: every string the phone may receive is defined here. Exception
@@ -296,6 +298,9 @@ class SyncContext:
     # thread and the desktop UI thread (create_account / reprocess_held).
     _state_lock: threading.Lock = field(default_factory=threading.Lock)
     _shutdown_event: threading.Event = field(default_factory=threading.Event)
+
+    on_unknown_accounts: Optional[Callable[[list], None]] = None
+    on_sync_completed: Optional[Callable[[], None]] = None
 
     def get_session_key(self) -> bytes:
         """Return the key for the currently confirmed handshake."""
@@ -794,6 +799,11 @@ def _handle_sync(ctx: SyncContext, data: dict) -> tuple:
                 if not ok:
                     raise RuntimeError(f"Ledger rejected {tx_id}: {msg}")
             ctx.gl.commit_transaction()
+            if ctx.on_sync_completed:
+                try:
+                    ctx.on_sync_completed()
+                except Exception:
+                    logger.exception("on_sync_completed callback failed")
         except Exception as batch_err:
             logger.exception("Ledger commit failed; rolling back batch")
             try:
