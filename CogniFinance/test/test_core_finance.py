@@ -149,7 +149,7 @@ def test_edit_preserves_old_state_in_history(temp_ledger):
     tx_id = temp_ledger.transactions[-1].id
 
     # 2. Edit the transaction to $15.00
-    new_lines = [("Checking Account", 0, 15.00), ("Groceries", 15.00, 0)]
+    new_lines = [(None, "Checking Account", 0, 15.00), (None, "Groceries", 15.00, 0)]
     ok2, msg2 = temp_ledger.update_transaction(tx_id, "2026-01-01", "Updated Dinner", new_lines)
     assert ok2 is True, f"Update failed: {msg2}"
 

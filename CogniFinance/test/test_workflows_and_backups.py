@@ -161,7 +161,7 @@ def test_encrypted_backup_and_restore(temp_ledger):
         tx_id = temp_ledger.transactions[-1].id
         temp_ledger.update_transaction(
             tx_id, "2026-01-02", "Updated Groceries",
-            [("Groceries", 60, 0), ("Checking Account", 0, 60)]
+            [(None, "Groceries", 60, 0), (None, "Checking Account", 0, 60)]
         )
 
         # Backup again

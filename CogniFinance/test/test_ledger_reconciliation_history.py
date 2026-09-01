@@ -105,7 +105,7 @@ class TestTransactionHistory(LedgerTestCase):
 
         self.gl.update_transaction(
             tx_id, "2026-01-05", "Coffee (corrected)",
-            [("Checking Account", 0, 6.75), ("Groceries", 6.75, 0)],
+            [(None, "Checking Account", 0, 6.75), (None, "Groceries", 6.75, 0)],
         )
 
         history = self.gl.get_transaction_history(tx_id)
@@ -146,7 +146,7 @@ class TestTransactionHistory(LedgerTestCase):
 
     def test_update_of_nonexistent_transaction_does_not_log_history(self):
         ok, msg = self.gl.update_transaction(
-            999999, "2026-01-05", "Ghost", [("Checking Account", 0, 1), ("Groceries", 1, 0)]
+            999999, "2026-01-05", "Ghost", [(None, "Checking Account", 0, 1), (None, "Groceries", 1, 0)]
         )
         self.assertFalse(ok)
         self.assertEqual(self.gl.get_transaction_history(999999), [])

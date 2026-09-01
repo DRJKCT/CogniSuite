@@ -6,6 +6,9 @@ accounting. This module is read-only and only touches the
 sql_transaction_history table. It opens its own SQLCipher connections
 using the same passphrase as the main ledger, so it doesn't need to
 share state with the GeneralLedger instance.
+audit.py ver 0.1
+For CogniFinance ver 1.8
+
 """
 import json
 from typing import List, Dict, Any, Optional

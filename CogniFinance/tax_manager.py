@@ -1,3 +1,6 @@
+# tax_manager.py ver 0.1
+# For CogniFinance ver 1.8
+
 import os
 import json
 import logging

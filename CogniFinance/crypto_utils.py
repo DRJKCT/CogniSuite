@@ -1,3 +1,8 @@
+"""
+crypto_utils.py ver.0.1
+For CogniFinance ver 1.8
+"""
+
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes

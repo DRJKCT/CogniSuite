@@ -1,3 +1,8 @@
+"""
+pareser_integration.py ver 0.2
+For CogniFinance ver 1.8
+"""
+
 import os
 import re
 from typing import List, Dict, Any, Optional, Tuple
@@ -547,7 +552,13 @@ def raw_rows_to_import_lines(raw: List[Dict[str, Any]], ledger: "GeneralLedger")
             direction = "inflow"
         else:
             # Withdrawal / purchase / outflow: debit the expense category, credit the contra account.
-            category = ledger.apply_category_rules(desc) or "Uncategorized Expense"
+            matched_category = ledger.apply_category_rules(desc)
+
+            # ✅ DIAGNOSTIC LOGGING: See exactly what the rule engine is doing
+            import logging
+            logging.getLogger(__name__).info(f"[RULE ENGINE DEBUG] Desc: '{desc}' | Matched: '{matched_category}'")
+
+            category = matched_category or "Uncategorized Expense"
             posting_lines = [(category, abs(amount), 0.0), (contra_account, 0.0, abs(amount))]
             direction = "outflow"
 

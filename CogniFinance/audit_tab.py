@@ -3,6 +3,8 @@ Audit log tab for CogniFinance.
 
 Standalone QWidget that uses AuditLogReader for data access. Designed
 to be dropped into the main tab widget with minimal wiring in ui_main.py.
+audit_tab.py ver 0.1
+for CogniFinance ver 1.8
 """
 from typing import Optional
 

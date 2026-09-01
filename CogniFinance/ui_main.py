@@ -1,3 +1,6 @@
+# ui_main.py ver 0.5 Changed add/edit tab to remove accounting logic within ui_main.  Removed all math validation and left it to ledger.py
+# For CogniFinance ver 1.8
+
 import os
 import io
 import json
@@ -13,10 +16,10 @@ from PyQt6.QtWidgets import (
     QLabel, QTextEdit, QPushButton, QFileDialog, QMessageBox,
     QGridLayout, QLineEdit, QFormLayout, QScrollArea, QSplitter,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-    QComboBox, QDateEdit, QGroupBox, QDialog, QDialogButtonBox, QSizePolicy, QAbstractItemView, QStyledItemDelegate
+    QComboBox, QDateEdit, QGroupBox, QDialog, QDialogButtonBox, QSizePolicy, QAbstractItemView, QStyledItemDelegate, QTreeWidget, QTreeWidgetItem, QProgressDialog, QStyleOptionViewItem, QStyle
 )
 from PyQt6.QtCore import Qt, QDate, QEvent, QTimer
-from PyQt6.QtGui import QColor, QFont, QPixmap, QImage, QDoubleValidator
+from PyQt6.QtGui import QColor, QFont, QPixmap, QImage, QDoubleValidator, QStandardItemModel, QStandardItem, QPalette, QBrush
 from pathlib import Path
 from datetime import datetime
 
@@ -33,25 +36,151 @@ from protocol import make_pairing_code
 from log_tab import LogTab
 from audit_tab import AuditTab
 from tax_tab import TaxTab
-from ofx_import import parse_ofx_to_ledger_transactions
+from ofx_import import parse_ofx_to_ledger_transactions, OFXImportThread
 from TestRunnerManager import TestRunnerManager
+from graphs import ChartsTab
+from category_rules_tab import CategoryRulesTab
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 logger = logging.getLogger(__name__)
 
-# ui_main.py v0.2 - automatic data-view refresh
+class SuggestedMatchesDialog(QDialog):
+    def __init__(self, matches: List[Dict[str, Any]], ledger: GeneralLedger, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Review Suggested Mobile Matches")
+        self.resize(950, 550)
+        self.matches = matches
+        self.ledger = ledger
+        self.user_actions = {}
+
+        layout = QVBoxLayout(self)
+        info = QLabel(
+         "The following imported transactions closely match existing unreconciled entries.\n"
+         "<b>Confirm</b>: Consolidate into a single transaction and mark as reconciled.\n"
+         "<b>Reject</b>: Ignore the match and import the new line as a separate transaction."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(["New Date", "New Description", "Existing Description", "Status", "Date Diff", "Merchant Match", "Action"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+
+        for i, m in enumerate(matches):
+            self.table.insertRow(i)
+            p_tx = m["parsed_tx"]
+            self.table.setItem(i, 0, QTableWidgetItem(p_tx.get("date", "")))
+            self.table.setItem(i, 1, QTableWidgetItem(p_tx.get("description", "")))
+
+            # Fetch existing transaction description from ledger
+            existing_tx = next((t for t in self.ledger.transactions if t.id == m["pending_id"]), None)
+            existing_desc = existing_tx.description if existing_tx else "Unknown"
+            self.table.setItem(i, 2, QTableWidgetItem(existing_desc))
+
+            date_diff = m.get("date_diff_days", 0)
+            merchant_sim = m.get("merchant_similarity", 0.0)
+            merchant_pct = f"{merchant_sim * 100:.0f}%"
+
+            # 3: Status (Colored Circle)
+            if m["tier"] == "green":
+                tooltip = f"GREEN MATCH\nExact amount, Date diff: {date_diff}d, Merchant: {merchant_pct}"
+            else:
+                # Explain exactly why it's yellow
+                reasons = []
+                if date_diff > 1:
+                    reasons.append(f"Date is {date_diff} days apart")
+                if merchant_sim < 0.80:
+                    reasons.append(f"Merchant name similarity is only {merchant_pct}")
+                reason_text = ", ".join(reasons) if reasons else "Borderline match"
+                tooltip = f"YELLOW MATCH\nExact amount, but: {reason_text}"
+
+            tier_widget = self._create_tier_indicator(m["tier"], tooltip)
+            self.table.setCellWidget(i, 3, tier_widget)
+
+            # 4: Date Diff
+            diff_item = QTableWidgetItem(f"{date_diff} days")
+            diff_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(i, 4, diff_item)
+
+            # 5: Merchant Match (Color-coded text)
+            match_item = QTableWidgetItem(merchant_pct)
+            match_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if merchant_sim >= 0.80:
+                match_item.setForeground(QColor("#2e7d32"))  # Green text
+            elif merchant_sim >= 0.60:
+                match_item.setForeground(QColor("#f57c00"))  # Amber/Orange text
+            else:
+                match_item.setForeground(QColor("#c62828"))  # Red text
+            self.table.setItem(i, 5, match_item)
+
+            combo = QComboBox()
+            combo.addItems(["Confirm (Merge)", "Reject (Import as New)"])
+            # Default to Confirm for GREEN, Reject for YELLOW
+            combo.setCurrentIndex(0 if m["tier"] == "green" else 1)
+            combo.currentIndexChanged.connect(lambda idx, row=i: self._on_action_changed(row, idx))
+            self.table.setCellWidget(i, 6, combo)
+            self.user_actions[i] = "confirm" if combo.currentIndex() == 0 else "reject"
+
+        layout.addWidget(self.table)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _create_tier_indicator(self, tier: str, tooltip: str) -> QWidget:
+        """Creates a perfectly centered colored circle using a styled QLabel."""
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        label = QLabel()
+        label.setFixedSize(18, 18)  # Size of the circle
+        label.setToolTip(tooltip)
+
+        if tier == "green":
+            label.setStyleSheet("background-color: #2e7d32; border-radius: 9px;")
+        elif tier == "yellow":
+            label.setStyleSheet("background-color: #f9a825; border-radius: 9px;")
+        else:
+            label.setStyleSheet("background-color: #c62828; border-radius: 9px;")
+
+        layout.addWidget(label)
+        return container
+
+    def _on_action_changed(self, row, index):
+        self.user_actions[row] = "confirm" if index == 0 else "reject"
+
+    def get_confirmations(self):
+        return [self.matches[i] for i, action in self.user_actions.items() if action == "confirm"]
+
+    def get_rejections(self):
+        return [self.matches[i]["parsed_tx"] for i, action in self.user_actions.items() if action == "reject"]
 
 class BudgetApp(QMainWindow):
+    ACCOUNT_COLORS = {
+        "Asset": "#2e7d32",      # Green
+        "Liability": "#333333",  # Dark Gray / Black
+        "Equity": "#1565c0",     # Blue
+        "Revenue": "#6a1b9a",    # Purple
+        "Expense": "#c62828"     # Red
+    }
+
     def __init__(self, db_path: str, passphrase: str):
         super().__init__()
         self.gl = GeneralLedger(db_path, passphrase)
         self._tx_table_id_map = {}
-        self.rule_edit_id = None
         self.db_dir = os.path.dirname(self.gl.db_path)
         store_path = Path(self.db_dir) / "notifications.json"
         self.notifications = NotificationCenter(NotificationStore(store_path))
+        self.notifications.clear_resolved()
 
         # Mobile sync state.
         self.sync_server = None
@@ -74,11 +203,11 @@ class BudgetApp(QMainWindow):
         self.tab_transactions = QWidget()
         self.tab_transactions2 = QWidget()
         self.tab_budgets = QWidget()
-        self.tab_charts = QWidget()
+        self.tab_charts = ChartsTab(self.gl)
         self.tab_reports = QWidget()
         self.tab_accounts = QWidget()
         self.tab_balance = QWidget()
-        self.tab_rules = QWidget()
+        self.tab_rules = CategoryRulesTab(self.gl)
         self.tab_taxes = TaxTab(self.gl)
         self.tab_sync = QWidget()
         self.tab_log = LogTab()
@@ -104,11 +233,9 @@ class BudgetApp(QMainWindow):
         self._init_transactions()
         self._init_transactions_tab()
         self._init_budgets()
-        self._init_charts()
         self._init_reports_tab()
         self._init_accounts()
         self._init_balance_sheet()
-        self._init_category_rules()
         self._init_sync_tab()
 
         logging.getLogger().addHandler(self.tab_log.log_handler)
@@ -125,6 +252,86 @@ class BudgetApp(QMainWindow):
         self.backup_timer = QTimer(self)
         self.backup_timer.timeout.connect(lambda: self._create_safety_backup("periodic"))
         self.backup_timer.start(4 * 60 * 60 * 1000)
+
+    def _create_account_combo(self, account_name=None):
+        """Creates a QComboBox for account selection with color-coded account types."""
+
+        class _AccountColorDelegate(QStyledItemDelegate):
+            def paint(self, painter, option, index):
+                """Manually paint each dropdown item to bypass Linux native theme overrides."""
+                painter.save()
+
+                # 1. Draw the background
+                if option.state & QStyle.StateFlag.State_Selected:
+                    painter.fillRect(option.rect, option.palette.highlight())
+                elif option.state & QStyle.StateFlag.State_MouseOver:
+                    painter.fillRect(option.rect, QColor("#e8f0fe"))
+                else:
+                    painter.fillRect(option.rect, option.palette.base())
+
+                # 2. Extract the custom color from the model's ForegroundRole
+                brush = index.data(Qt.ItemDataRole.ForegroundRole)
+                text_color = QColor("#000000")
+                if brush is not None:
+                    c = brush.color() if hasattr(brush, 'color') else brush
+                    if isinstance(c, QColor):
+                        text_color = c
+
+                # 3. Draw the text with the custom color
+                painter.setPen(text_color)
+                font = option.font
+                font.setBold(True)
+                painter.setFont(font)
+
+                text = index.data(Qt.ItemDataRole.DisplayRole) or ""
+                painter.drawText(
+                    option.rect.adjusted(8, 0, -8, 0),
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                    text
+                )
+
+                painter.restore()
+
+        combo = QComboBox()
+        delegate = _AccountColorDelegate(combo)
+        combo.setItemDelegate(delegate)
+        combo.view().setItemDelegate(delegate)
+
+        model = QStandardItemModel()
+        account_names = sorted(self.gl.accounts.keys())
+
+        for name in account_names:
+            acc = self.gl.accounts.get(name)
+            acc_type = acc.account_type if acc else "Expense"
+            color_hex = self.ACCOUNT_COLORS.get(acc_type, "#000000")
+
+            item = QStandardItem(name)
+            item.setData(name, Qt.ItemDataRole.UserRole)
+            item.setForeground(QColor(color_hex))
+            model.appendRow(item)
+
+        combo.setModel(model)
+
+        if account_name is not None:
+            for i in range(model.rowCount()):
+                if model.item(i).data(Qt.ItemDataRole.UserRole) == account_name:
+                    combo.setCurrentIndex(i)
+                    break
+
+        # Update the closed combo box text color to match the selected account type
+        def _update_text_color(index):
+            if index >= 0:
+                item = model.item(index)
+                if item:
+                    color = item.foreground().color()
+                    combo.setStyleSheet(
+                        f"QComboBox {{ color: {color.name()}; font-weight: bold; }}"
+                    )
+
+        combo.currentIndexChanged.connect(_update_text_color)
+        _update_text_color(combo.currentIndex())
+
+        return combo
 
     def safe_trigger_audit(self):
         """Safely initiates scheduled integrity checks."""
@@ -179,12 +386,14 @@ class BudgetApp(QMainWindow):
         self.sync_start_button.setToolTip("Start Mobile Sync")
 
         if success:
-            self.notifications.add(
-                Severity.INFO,
-                "Integrity Checks Complete",
-                message,
-                "integrity_check_complete"
-            )
+            if "No audits currently due" not in message:
+                self.notifications.resolve("integrity_check_complete")
+                self.notifications.add(
+                    Severity.INFO,
+                    "Integrity Checks Complete",
+                    message,
+                    "integrity_check_complete"
+                )
             self._log_audit_message(f"✅ {message}")
             self.notifications.resolve("weekly_integrity_check")
             self.notifications.resolve("deep_integrity_check")
@@ -227,7 +436,7 @@ class BudgetApp(QMainWindow):
             self.tab_transactions: self.apply_transaction_filters,
             self.tab_transactions2: self.apply_transactions_tab_filters,
             self.tab_budgets: self.refresh_budget_list,
-            self.tab_charts: self.refresh_charts,
+            self.tab_charts: self.tab_charts.refresh_charts,
             self.tab_reports: self.refresh_monthly_report,
             self.tab_reconcile: self.load_unreconciled,
             self.tab_balance: self.refresh_balance_sheet,
@@ -280,10 +489,13 @@ class BudgetApp(QMainWindow):
         btn_row = QHBoxLayout()
         btn_add = QPushButton("Add New Account")
         btn_add.clicked.connect(self.add_new_account)
+        btn_edit = QPushButton("Edit Selected")
+        btn_edit.clicked.connect(self.edit_selected_account)
         btn_delete = QPushButton("Delete Selected")
         btn_delete.clicked.connect(self.delete_selected_account)
 
         btn_row.addWidget(btn_add)
+        btn_row.addWidget(btn_edit)
         btn_row.addWidget(btn_delete)
         btn_row.addStretch()
         layout.addLayout(btn_row)
@@ -345,8 +557,148 @@ class BudgetApp(QMainWindow):
         else:
             QMessageBox.warning(self, "Error", msg)
 
+    def edit_selected_account(self):
+        selected = self.accounts_table.selectedItems()
+        if not selected:
+            QMessageBox.information(self, "No selection", "Please select an account to edit.")
+            return
+
+        old_name = selected[0].text()
+        acc = self.gl.accounts.get(old_name)
+        if not acc:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Edit Account")
+        layout = QVBoxLayout(dialog)
+
+        form = QFormLayout()
+        name_edit = QLineEdit(old_name)
+        type_combo = QComboBox()
+        for t in ["Asset", "Liability", "Equity", "Revenue", "Expense"]:
+            type_combo.addItem(t)
+        type_combo.setCurrentText(acc.account_type)
+
+        form.addRow("Account Name:", name_edit)
+        form.addRow("Account Type:", type_combo)
+        layout.addLayout(form)
+
+        warning = QLabel("<b>Note:</b> Changing the name will automatically update all historical transactions, budgets, and rules associated with this account.")
+        warning.setWordWrap(True)
+        warning.setStyleSheet("color: #d68910;")
+        layout.addWidget(warning)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_name = name_edit.text().strip()
+            new_type = type_combo.currentText()
+
+            if not new_name:
+                QMessageBox.warning(self, "Error", "Account name cannot be empty.")
+                return
+
+            ok, msg = self.gl.update_account(old_name, new_name, new_type)
+            if ok:
+                self.refresh_accounts_table()
+                self.refresh_account_combos()
+                self.tab_rules.refresh_rules_table()
+                QMessageBox.information(self, "Success", msg)
+            else:
+                QMessageBox.warning(self, "Error", msg)
+
+    """
+    ======================================================================
+    IMPORT LOGIC & MATCH PROCESSING
+    ======================================================================
+    """
+
+    def _process_confirmed_matches(self, confirmations: List[Dict[str, Any]]):
+        """Updates pending transactions with bank data, marks reconciled, and deletes duplicates."""
+        for conf in confirmations:
+            pending_id = conf["pending_id"]
+            p_tx = conf["parsed_tx"]
+            match_type = conf.get("match_type", "mobile_to_bank") # Default to legacy behavior
+
+            bank_date = p_tx.get("date")
+            if "statement_balance" in p_tx:
+                bank_date = normalize_statement_date(bank_date) or datetime.now().strftime("%Y-%m-%d")
+            bank_desc = p_tx.get("description", "")
+
+            tx = next((t for t in self.gl.transactions if t.id == pending_id), None)
+            if tx:
+                if match_type == "mobile_to_bank":
+                    # LEGACY BEHAVIOR: Preserve the mobile app's existing split-lines/categories
+                    existing_lines = [(l.id, l.account_name, l.dr, l.cr) for l in tx.lines]
+                    ok, msg = self.gl.update_transaction(pending_id, bank_date, bank_desc, existing_lines)
+                    if ok:
+                        self.gl.mark_reconciled(pending_id, True)
+                    else:
+                        logger.warning(f"Failed to merge mobile match {pending_id}: {msg}")
+
+                elif match_type == "bank_to_bank":
+                    # NEW BEHAVIOR: Both are bank imports. Keep the existing one, update it,
+                    # and physically delete the newly imported duplicate to prevent double-counting.
+                    existing_lines = [(l.id, l.account_name, l.dr, l.cr) for l in tx.lines]
+                    ok, msg = self.gl.update_transaction(pending_id, bank_date, bank_desc, existing_lines)
+
+                    if ok:
+                        self.gl.mark_reconciled(pending_id, True)
+
+                        # Now delete the duplicate imported transaction
+                        duplicate_imp_id = p_tx.get("imported_id")
+                        if duplicate_imp_id:
+                            duplicate_tx = next((t for t in self.gl.transactions if t.imported_id == duplicate_imp_id), None)
+                            if duplicate_tx:
+                                del_ok, del_msg = self.gl.delete_transaction(duplicate_tx.id)
+                                if del_ok:
+                                    logger.info(f"Bank-to-Bank merge: Deleted duplicate transaction {duplicate_tx.id} (Imported ID: {duplicate_imp_id})")
+                                else:
+                                    logger.warning(f"Failed to delete duplicate transaction {duplicate_tx.id}: {del_msg}")
+                    else:
+                        logger.warning(f"Failed to update existing transaction for bank-to-bank merge {pending_id}: {msg}")
+
+    def _process_rejected_matches(self, rejected_txs: List[Dict[str, Any]], source: str):
+        """Imports rejected matches as brand new transactions."""
+        imported = 0
+        for tx in rejected_txs:
+            date_str = tx.get("date")
+            if source == "pdf":
+                date_str = normalize_statement_date(date_str) or datetime.now().strftime("%Y-%m-%d")
+
+            desc = tx.get("description", "")
+            lines = tx.get("lines", [])
+            imp_id = tx.get("imported_id")
+
+            if not imp_id and source == "pdf":
+                amount = tx.get("amount", 0)
+                imp_id = f"rejected::{date_str}::{desc[:40]}::{amount}"
+
+            ok, msg = self.gl.record_transaction(date_str, desc, lines, imported_id=imp_id, persist=True)
+            if ok:
+                imported += 1
+                if source == "pdf" and tx.get("statement_balance") is not None:
+                    self.gl.record_statement_balance(tx["contra_account"], date_str, tx["statement_balance"], source="rejected_match")
+        return imported
+
+    def update_progress_dialog(self, percent: int, message: str):
+        """Updates the visual progress dialog."""
+        dialog = getattr(self, 'progress_dialog', None)
+
+        if dialog is not None:
+            try:
+                dialog.setValue(percent)
+                dialog.setLabelText(message)
+            except RuntimeError:
+                # Catch edge cases where the underlying C++ Qt object
+                # was already deleted/garbage-collected
+                pass
+
     def import_ofx_qfx(self):
-        """Handles importing structured OFX/QFX bank feeds."""
+        """Handles importing structured OFX/QFX bank feeds in a background thread."""
         files, _ = QFileDialog.getOpenFileNames(
             self, "Import OFX/QFX Bank Feed", "",
             "Bank Feeds (*.ofx *.qfx);;All Files (*)"
@@ -354,52 +706,59 @@ class BudgetApp(QMainWindow):
         if not files:
             return
 
-        total_imported = 0
-        total_skipped = 0
+        # 1. Setup the visual progress dialog
+        self.progress_dialog = QProgressDialog("Importing OFX/QFX...", "Cancel", 0, 100, self)
+        self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress_dialog.setAutoClose(True)
+        self.progress_dialog.setMinimumDuration(500) # Only shows if it takes > 0.5s
+        self.progress_dialog.show()
 
-        for file_path in files:
-            try:
-                txns, new_accounts = parse_ofx_to_ledger_transactions(file_path, self.gl)
+        # 2. Setup and start the background thread
+        self.ofx_thread = OFXImportThread(files, self.gl)
+        self.ofx_thread.progress_signal.connect(self.update_progress_dialog)
+        self.ofx_thread.finished_signal.connect(self.on_ofx_import_finished)
+        self.ofx_thread.error_signal.connect(self.on_import_error)
+        self.ofx_thread.finished.connect(self.ofx_thread.deleteLater)
 
-                if new_accounts:
-                    names = ", ".join([f"{n} ({t})" for n, t in new_accounts])
-                    logger.info(f"OFX Import: Auto-created accounts: {names}")
+        self.ofx_thread.start()
 
-                imported_count = 0
-                for tx in txns:
-                    ok, msg = self.gl.record_transaction(
-                        date=tx["date"],
-                        description=tx["description"],
-                        lines_data=tx["lines"],
-                        imported_id=tx["imported_id"],
-                        persist=True
-                    )
-                    if ok:
-                        imported_count += 1
-                    else:
-                        logger.warning(f"OFX Import: Ledger rejected transaction '{tx['description']}': {msg}")
-                        total_skipped += 1
+    def on_ofx_import_finished(self, imported_count: int, review: dict):
+        """Called when the OFX background thread completes."""
+        # Close the progress dialog
+        if hasattr(self, 'progress_dialog') and self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
 
-                total_imported += imported_count
-                logger.info(f"OFX Import: Successfully imported {imported_count} transactions from {os.path.basename(file_path)}")
+        suggested_matches = review.get("suggested_matches", [])
+        total_skipped = review.get("skipped_count", 0)
+        new_accounts = review.get("new_accounts", [])
 
-            except Exception as e:
-                logger.error(f"OFX Import failed for {os.path.basename(file_path)}: {e}")
-                QMessageBox.critical(self, "Import Failed", f"Error processing {os.path.basename(file_path)}:\n{e}")
+        if new_accounts:
+            names = ", ".join([f"{n} ({t})" for n, t in new_accounts])
+            logger.info(f"OFX Import: Auto-created accounts: {names}")
 
+        # Show the Suggested Matches Dialog if needed
+        if suggested_matches:
+            dialog = SuggestedMatchesDialog(suggested_matches, self.gl, self)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self._process_confirmed_matches(dialog.get_confirmations())
+                rejected_count = self._process_rejected_matches(dialog.get_rejections(), source="ofx")
+                imported_count += rejected_count
+
+        # Final summary message
+        summary_msg = f"Successfully imported {imported_count} transaction(s).\n"
+        if total_skipped > 0:
+            summary_msg += f"Skipped/Rejected by Ledger: {total_skipped}.\n"
+        summary_msg += "\nNote: Transactions are currently categorized as 'Uncategorized'. "
+        summary_msg += "Please review them in the Transactions tab or set up Category Rules."
+
+        QMessageBox.information(self, "Import Complete", summary_msg)
+
+        # Refresh UI
         self.apply_transaction_filters()
         self.apply_transactions_tab_filters()
         self.refresh_overview()
         self.refresh_account_combos()
-
-        QMessageBox.information(
-            self,
-            "Import Complete",
-            f"Successfully imported {total_imported} transaction(s).\n"
-            f"Skipped/Rejected: {total_skipped}.\n\n"
-            "Note: Transactions are currently categorized as 'Uncategorized'. "
-            "Please review them in the Transactions tab or set up Category Rules."
-        )
 
     def _money_item(self, value, editable=False):
         """Create a right-aligned, non-editable table item for monetary values."""
@@ -663,14 +1022,14 @@ class BudgetApp(QMainWindow):
     def _transaction_display_amount(self, tx) -> Decimal:
         amount = Decimal("0.00")
         for line in tx.lines:
-            acc = self.gl.accounts[line.account_name]
+            acc = self.gl.accounts.get(line.account_name)
             if acc.account_type == "Expense" and line.dr > 0:
                 amount += line.dr
         if amount > 0:
             return amount
 
         for line in tx.lines:
-            acc = self.gl.accounts[line.account_name]
+            acc = self.gl.accounts.get(line.account_name)
             if acc.account_type == "Revenue" and line.cr > 0:
                 amount += line.cr
         if amount > 0:
@@ -790,7 +1149,7 @@ class BudgetApp(QMainWindow):
         self.tx_table2 = QTableWidget()
         self.tx_table2.setColumnCount(5)
         self.tx_table2.setHorizontalHeaderLabels(["Date", "Description", "From", "To", "Amount"])
-        self._setup_table_headers(self.tx_table2, [0.11, 0.37, 0.18, 0.18, 0.16])
+        self._setup_table_headers(self.tx_table2, [0.17, 0.37, 0.18, 0.18, 0.10])
         self.tx_table2.doubleClicked.connect(self.edit_selected_transaction)
 
         layout.addWidget(self.tx_table2)
@@ -842,12 +1201,10 @@ class BudgetApp(QMainWindow):
         current_from = self.tx_from.currentData()
         current_to = self.tx_to.currentData()
         current_budget = self.budget_category.currentData()
-        current_rule = self.rule_category.currentData()
 
         self.tx_from.clear()
         self.tx_to.clear()
         self.budget_category.clear()
-        self.rule_category.clear()
 
         for name in account_names:
             self.tx_from.addItem(name, name)
@@ -857,7 +1214,6 @@ class BudgetApp(QMainWindow):
 
         for name in sorted(expense_accounts):
             self.budget_category.addItem(name, name)
-            self.rule_category.addItem(name, name)
 
         if current_from:
             idx = self.tx_from.findData(current_from)
@@ -874,10 +1230,8 @@ class BudgetApp(QMainWindow):
             if idx >= 0:
                 self.budget_category.setCurrentIndex(idx)
 
-        if current_rule:
-            idx = self.rule_category.findData(current_rule)
-            if idx >= 0:
-                self.rule_category.setCurrentIndex(idx)
+        if hasattr(self, 'tab_rules') and hasattr(self.tab_rules, '_populate_category_combo'):
+            self.tab_rules._populate_category_combo()
 
     def apply_transactions_tab_filters(self):
         start = self.tx_filter_start.date().toString("yyyy-MM-dd") or None
@@ -903,12 +1257,7 @@ class BudgetApp(QMainWindow):
             self.tx_table2.setItem(row, 2, QTableWidgetItem(from_acc))
             self.tx_table2.setItem(row, 3, QTableWidgetItem(to_acc))
 
-            amount = 0.0
-            for line in tx.lines:
-                acc = self.gl.accounts[line.account_name]
-                if acc.account_type in ("Revenue", "Expense"):
-                    amount = line.cr if acc.account_type == "Revenue" else line.dr
-                    break
+            amount = self._transaction_display_amount(tx)
             self.tx_table2.setItem(row, 4, QTableWidgetItem(f"{amount:,.2f}"))
 
             if tx.id is not None:
@@ -1154,47 +1503,6 @@ class BudgetApp(QMainWindow):
         else:
             QMessageBox.warning(self, "Budget error", msg)
 
-    def _init_charts(self):
-        layout = QVBoxLayout(self.tab_charts)
-        self._add_refresh_row(layout, self.refresh_charts)
-
-        controls = QHBoxLayout()
-        self.chart_month = QDateEdit()
-        self.chart_month.setCalendarPopup(True)
-        self.chart_month.setDate(QDate.currentDate())
-
-        controls.addWidget(QLabel("Month:"))
-        controls.addWidget(self.chart_month)
-        controls.addStretch()
-        layout.addLayout(controls)
-
-        self.figure = Figure(figsize=(6, 4), dpi=100)
-        self.canvas = FigureCanvas(self.figure)
-        layout.addWidget(self.canvas)
-
-        self.refresh_charts()
-
-    def refresh_charts(self):
-        self.figure.clear()
-        month = self.chart_month.date().toString("yyyy-MM")
-        spending = self.gl.spending_by_category(month)
-
-        if not spending:
-            self.figure.text(0.5, 0.5, "No expense data for this month.", ha="center")
-            self.canvas.draw()
-            return
-
-        ax = self.figure.add_subplot(111)
-        cats = list(spending.keys())
-        vals = [spending[c] for c in cats]
-
-        ax.bar(range(len(cats)), vals)
-        ax.set_xticks(range(len(cats)))
-        ax.set_xticklabels(cats, rotation=30, ha="right")
-        ax.set_title(f"Spending by Category – {month}")
-        ax.set_ylabel("Amount ($)")
-
-        self.canvas.draw()
 
     def _init_reports_tab(self):
         layout = QVBoxLayout(self.tab_reports)
@@ -1313,16 +1621,22 @@ class BudgetApp(QMainWindow):
         )
         layout.addWidget(info)
 
-        self.reconcile_table = QTableWidget()
-        self.reconcile_table.setColumnCount(5)
-        self.reconcile_table.setHorizontalHeaderLabels(["ID", "Date", "Description", "Imported ID", "Reconciled"])
-        self._setup_table_headers(self.reconcile_table, [0.08, 0.13, 0.52, 0.17, 0.10])
-        layout.addWidget(self.reconcile_table)
+        self.reconcile_tree = QTreeWidget()
+        self.reconcile_tree.setColumnCount(5)
+        self.reconcile_tree.setHeaderLabels(["ID", "Date", "Description / Account", "Imported ID / Amount", "Reconciled"])
+
+        header = self.reconcile_tree.header()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(True)
+        header.setHighlightSections(False)
+
+        self.reconcile_tree.setRootIsDecorated(True)
+        self.reconcile_tree.setAlternatingRowColors(True)
+        layout.addWidget(self.reconcile_tree)
 
         btn_row = QHBoxLayout()
         btn_mark = QPushButton("Mark Selected as Reconciled")
         btn_mark.clicked.connect(self.mark_selected_reconciled)
-
         btn_row.addWidget(btn_mark)
         btn_row.addStretch()
         layout.addLayout(btn_row)
@@ -1331,33 +1645,53 @@ class BudgetApp(QMainWindow):
 
     def load_unreconciled(self):
         txs = self.gl.get_unreconciled_transactions()
-        self.reconcile_table.setRowCount(len(txs))
-        for row, tx in enumerate(txs):
-            self.reconcile_table.setItem(row, 0, QTableWidgetItem(str(tx.id)))
-            self.reconcile_table.setItem(row, 1, QTableWidgetItem(tx.date))
-            self.reconcile_table.setItem(row, 2, QTableWidgetItem(tx.description))
-            self.reconcile_table.setItem(row, 3, QTableWidgetItem(tx.imported_id or ""))
-            rec_item = QTableWidgetItem("Yes" if tx.reconciled else "No")
-            rec_item.setFlags(rec_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.reconcile_table.setItem(row, 4, rec_item)
+        self.reconcile_tree.clear()
+        for tx in txs:
+            # --- TOP LEVEL ITEM (Main Transaction) ---
+            item = QTreeWidgetItem(self.reconcile_tree)
+            item.setData(0, Qt.ItemDataRole.UserRole, tx.id) # Store DB ID
+            item.setText(0, str(tx.id))
+            item.setText(1, tx.date)
+            item.setText(2, tx.description)
+            item.setText(3, tx.imported_id or "")
+            item.setText(4, "Yes" if tx.reconciled else "No")
+
+            # Make it selectable
+            flags = item.flags() | Qt.ItemFlag.ItemIsSelectable
+            item.setFlags(flags)
+
+            # --- CHILD ITEMS (Split Lines) ---
+            for line in tx.lines:
+                sub_item = QTreeWidgetItem(item)
+                sub_item.setText(2, line.account_name)
+
+                dr_text = f"Dr: {line.dr:.2f}" if line.dr > 0 else ""
+                cr_text = f"Cr: {line.cr:.2f}" if line.cr > 0 else ""
+                sub_item.setText(3, f"{dr_text}  {cr_text}".strip())
+
+                # Style sub-rows to look like indented split-lines
+                sub_color = QColor("#f0f4f8")
+                for col in range(5):
+                    sub_item.setBackground(col, sub_color)
+
+                # Prevent sub-rows from being selected independently
+                sub_item.setFlags(sub_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+
 
     def mark_selected_reconciled(self):
-        selected = self.reconcile_table.selectedItems()
-        if not selected:
+        item = self.reconcile_tree.currentItem()
+        if not item:
             QMessageBox.information(self, "No selection", "Please select a transaction row.")
             return
 
-        row = selected[0].row()
-        id_item = self.reconcile_table.item(row, 0)
-        if not id_item:
-            return
-        try:
-            tx_id = int(id_item.text())
-        except ValueError:
-            return
+        # Ensure we are acting on the top-level item (in case user clicked a sub-row)
+        while item.parent() is not None:
+            item = item.parent()
 
-        self.gl.mark_reconciled(tx_id, True)
-        self.load_unreconciled()
+        tx_id = item.data(0, Qt.ItemDataRole.UserRole)
+        if tx_id is not None:
+            self.gl.mark_reconciled(tx_id, True)
+            self.load_unreconciled()
 
     def _init_balance_sheet(self):
         layout = QVBoxLayout(self.tab_balance)
@@ -1473,11 +1807,18 @@ class BudgetApp(QMainWindow):
             if name not in self.gl.accounts:
                 self.gl.create_account(name, t)
 
+        self.progress_dialog = QProgressDialog("Importing PDF Statements...", "Cancel", 0, 100, self)
+        self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress_dialog.setAutoClose(True)
+        self.progress_dialog.setMinimumDuration(500)
+        self.progress_dialog.show()
+
         bank = self.import_bank.currentData()
         statement_type = self.import_statement_type.currentData() or "auto"
         self.import_thread = PDFImportThread(files=files, ledger=self.gl, bank=bank, statement_type=statement_type)
 
-        self.import_thread.progress_signal.connect(self.update_status_bar)
+        # 2. Connect to the new progress dialog updater
+        self.import_thread.progress_signal.connect(self.update_progress_dialog)
         self.import_thread.finished_signal.connect(self.on_import_success)
         self.import_thread.error_signal.connect(self.on_import_error)
         self.import_thread.finished.connect(self.import_thread.deleteLater)
@@ -1489,14 +1830,31 @@ class BudgetApp(QMainWindow):
         self.statusBar().showMessage(message)
 
     def on_import_success(self, imported_count: int, review: dict):
+        if hasattr(self, 'progress_dialog') and self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+
         self.btn_import_pdf.setEnabled(True)
 
         skipped = review.get("skipped_lines", [])
         mismatches = review.get("balance_mismatches", [])
         unverified = review.get("unverified_count", 0)
         needs_review = bool(skipped or mismatches or unverified)
+        suggested_matches = review.get("suggested_matches", [])
 
+        needs_review = bool(skipped or mismatches or unverified)
         summary = f"Imported {imported_count} transactions successfully."
+
+        if suggested_matches:
+            dialog = SuggestedMatchesDialog(suggested_matches, self.gl, self)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self._process_confirmed_matches(dialog.get_confirmations())
+                rejected_count = self._process_rejected_matches(dialog.get_rejections(), source="pdf")
+                imported_count += rejected_count
+
+        needs_review = bool(skipped or mismatches or unverified)
+        summary = f"Imported {imported_count} transactions successfully."
+
         if needs_review:
             parts = []
             if skipped:
@@ -1513,6 +1871,7 @@ class BudgetApp(QMainWindow):
             box.setText(summary)
 
             detail_lines = []
+
             if skipped:
                 detail_lines.append("=== Lines that could not be parsed ===")
                 for item in skipped[:50]:
@@ -1539,6 +1898,9 @@ class BudgetApp(QMainWindow):
         self.refresh_overview()
 
     def on_import_error(self, error_message: str):
+        if hasattr(self, 'progress_dialog') and self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
         self.btn_import_pdf.setEnabled(True)
         QMessageBox.critical(self, "Import Error", error_message)
 
@@ -1709,6 +2071,26 @@ class BudgetApp(QMainWindow):
         self.sync_status_timer.start()
         self.poll_mobile_sync_status()
 
+        self.sync_status_timer = QTimer(self)
+        self.sync_status_timer.setInterval(1000)
+        self.sync_status_timer.timeout.connect(self.poll_mobile_sync_status)
+        self.sync_status_timer.start()
+        self.poll_mobile_sync_status()
+
+        # --- NEW: 5-Minute Hard Timeout for Security ---
+        # If the user starts the server but never syncs, this forces it to close,
+        # freeing the port and unblocking the audit scheduler.
+        self.sync_timeout_timer = QTimer(self)
+        self.sync_timeout_timer.setSingleShot(True)
+        self.sync_timeout_timer.timeout.connect(self._force_stop_sync_timeout)
+        self.sync_timeout_timer.start(5 * 60 * 1000)  # 5 minutes
+
+    def _force_stop_sync_timeout(self):
+        """Auto-closes the sync server after 5 minutes of inactivity."""
+        if self.sync_server is not None:
+            self._append_sync_log("Sync server auto-closed: 5-minute inactivity timeout reached.")
+            self.stop_mobile_sync(from_server=True)
+
     def _sync_request(self, path: str):
         if self.sync_server is None:
             return None
@@ -1828,6 +2210,10 @@ class BudgetApp(QMainWindow):
         if server is None:
             return
 
+        if hasattr(self, 'sync_timeout_timer') and self.sync_timeout_timer is not None:
+            self.sync_timeout_timer.stop()
+            self.sync_timeout_timer = None
+
         if self.sync_status_timer is not None:
             self.sync_status_timer.stop()
             self.sync_status_timer.deleteLater()
@@ -1902,168 +2288,6 @@ class BudgetApp(QMainWindow):
             pass
         super().closeEvent(event)
 
-    def _init_category_rules(self):
-        layout = QVBoxLayout(self.tab_rules)
-
-        form_box = QGroupBox("Add / Edit Category Rule")
-        flayout = QFormLayout()
-
-        self.rule_keyword = QLineEdit()
-        self.rule_keyword.setPlaceholderText("e.g. T&T, STARBUCKS, GROCERY")
-
-        self.rule_category = QComboBox()
-        expense_accounts = [name for name, acc in self.gl.accounts.items() if acc.account_type == "Expense"]
-        for name in sorted(expense_accounts):
-            self.rule_category.addItem(name, name)
-
-        self.rule_case = QComboBox()
-        self.rule_case.addItem("Case insensitive", False)
-        self.rule_case.addItem("Case sensitive", True)
-
-        self.rule_enabled = QComboBox()
-        self.rule_enabled.addItem("Enabled", True)
-        self.rule_enabled.addItem("Disabled", False)
-
-        flayout.addRow("Keyword:", self.rule_keyword)
-        flayout.addRow("Category:", self.rule_category)
-        flayout.addRow("Case match:", self.rule_case)
-        flayout.addRow("Status:", self.rule_enabled)
-
-        form_box.setLayout(flayout)
-        layout.addWidget(form_box)
-
-        btn_row = QHBoxLayout()
-        self.rule_edit_id = None
-
-        btn_add = QPushButton("Add Rule")
-        btn_add.clicked.connect(self.add_category_rule)
-
-        btn_update = QPushButton("Update Selected")
-        btn_update.clicked.connect(self.update_category_rule)
-
-        btn_delete = QPushButton("Delete Selected")
-        btn_delete.clicked.connect(self.delete_category_rule)
-
-        btn_row.addWidget(btn_add)
-        btn_row.addWidget(btn_update)
-        btn_row.addWidget(btn_delete)
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
-
-        self.rules_table = QTableWidget()
-        self.rules_table.setColumnCount(5)
-        self.rules_table.setHorizontalHeaderLabels(["ID", "Keyword", "Category", "Case", "Enabled"])
-
-        self._setup_table_headers(self.rules_table, [0.08, 0.38, 0.32, 0.11, 0.11])
-        self.rules_table.itemSelectionChanged.connect(self.on_rule_selected)
-
-        layout.addWidget(self.rules_table)
-        self.refresh_rules_table()
-
-    def refresh_rules_table(self):
-        rules = self.gl.get_category_rules()
-        self.rules_table.setRowCount(len(rules))
-        for row, r in enumerate(rules):
-            self.rules_table.setItem(row, 0, QTableWidgetItem(str(r.id)))
-            self.rules_table.setItem(row, 1, QTableWidgetItem(r.keyword))
-            self.rules_table.setItem(row, 2, QTableWidgetItem(r.category))
-            self.rules_table.setItem(row, 3, QTableWidgetItem("Yes" if r.case_sensitive else "No"))
-            self.rules_table.setItem(row, 4, QTableWidgetItem("Yes" if r.enabled else "No"))
-
-    def on_rule_selected(self):
-        selected = self.rules_table.selectedItems()
-        if not selected:
-            return
-        row = selected[0].row()
-        id_item = self.rules_table.item(row, 0)
-        if not id_item:
-            return
-        try:
-            rule_id = int(id_item.text())
-        except ValueError:
-            return
-
-        rule = next((r for r in self.gl.category_rules if r.id == rule_id), None)
-        if not rule:
-            return
-
-        self.rule_edit_id = rule_id
-        self.rule_keyword.setText(rule.keyword)
-
-        idx = self.rule_category.findData(rule.category)
-        if idx >= 0:
-            self.rule_category.setCurrentIndex(idx)
-
-        idx = self.rule_case.findData(rule.case_sensitive)
-        if idx >= 0:
-            self.rule_case.setCurrentIndex(idx)
-
-        idx = self.rule_enabled.findData(rule.enabled)
-        if idx >= 0:
-            self.rule_enabled.setCurrentIndex(idx)
-
-    def add_category_rule(self):
-        keyword = self.rule_keyword.text().strip()
-        category = self.rule_category.currentData()
-        case_sensitive = self.rule_case.currentData()
-        enabled = self.rule_enabled.currentData()
-
-        if not keyword or not category:
-            QMessageBox.warning(self, "Invalid rule", "Keyword and category are required.")
-            return
-
-        ok, msg = self.gl.add_category_rule(keyword, category, case_sensitive, enabled)
-        if ok:
-            QMessageBox.information(self, "Rule added", msg)
-            self.refresh_rules_table()
-            self.rule_keyword.clear()
-        else:
-            QMessageBox.warning(self, "Rule error", msg)
-
-    def update_category_rule(self):
-        if self.rule_edit_id is None:
-            QMessageBox.information(self, "No selection", "Please select a rule to update.")
-            return
-
-        keyword = self.rule_keyword.text().strip()
-        category = self.rule_category.currentData()
-        case_sensitive = self.rule_case.currentData()
-        enabled = self.rule_enabled.currentData()
-
-        if not keyword or not category:
-            QMessageBox.warning(self, "Invalid rule", "Keyword and category are required.")
-            return
-
-        ok, msg = self.gl.update_category_rule(self.rule_edit_id, keyword, category, case_sensitive, enabled)
-        if ok:
-            QMessageBox.information(self, "Rule updated", msg)
-            self.refresh_rules_table()
-        else:
-            QMessageBox.warning(self, "Rule error", msg)
-
-    def delete_category_rule(self):
-        if self.rule_edit_id is None:
-            QMessageBox.information(self, "No selection", "Please select a rule to delete.")
-            return
-
-        reply = QMessageBox.question(
-            self,
-            "Delete rule",
-            "Are you sure you want to delete this rule?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        ok, msg = self.gl.delete_category_rule(self.rule_edit_id)
-        if ok:
-            QMessageBox.information(self, "Rule deleted", msg)
-            self.refresh_rules_table()
-            self.rule_keyword.clear()
-            self.rule_edit_id = None
-        else:
-            QMessageBox.warning(self, "Rule error", msg)
-
     def edit_selected_transaction(self):
         COL_ACCOUNT = 0
         COL_DEBIT = 1
@@ -2109,6 +2333,8 @@ class BudgetApp(QMainWindow):
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Edit Transaction")
+        dlg.resize(700, 600)
+        dlg.setMinimumSize(500, 400)
         dlg_layout = QVBoxLayout(dlg)
 
         form = QFormLayout()
@@ -2129,12 +2355,40 @@ class BudgetApp(QMainWindow):
         lines_box = QGroupBox("Transaction Lines (Double-entry)")
         lines_layout = QVBoxLayout(lines_box)
 
+        legend_html = """
+        <span style='color:#2e7d32; font-weight:bold;'>■ Asset</span> &nbsp;&nbsp;
+        <span style='color:#c62828; font-weight:bold;'>■ Expense</span> &nbsp;&nbsp;
+        <span style='color:#1565c0; font-weight:bold;'>■ Equity</span> &nbsp;&nbsp;
+        <span style='color:#6a1b9a; font-weight:bold;'>■ Revenue</span> &nbsp;&nbsp;
+        <span style='color:#333333; font-weight:bold;'>■ Liability</span>
+        """
+        legend_label = QLabel(legend_html)
+        legend_label.setTextFormat(Qt.TextFormat.RichText)
+        legend_label.setStyleSheet("margin-bottom: 4px;")
+        lines_layout.addWidget(legend_label)
+
         lines_table = QTableWidget()
         lines_table.setColumnCount(5)
         lines_table.setHorizontalHeaderLabels(["Account", "Debit", "Credit", "LineId", ""])
         lines_table.setColumnHidden(COL_LINEID, True)
         lines_table.setRowCount(0)
         lines_table.setSortingEnabled(False)
+
+        header = lines_table.horizontalHeader()
+        header.setSectionResizeMode(COL_DEBIT, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(COL_CREDIT, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(COL_DELETE, QHeaderView.ResizeMode.Fixed)
+        lines_table.setColumnWidth(COL_DELETE, 120)
+        header.setSectionResizeMode(COL_ACCOUNT, QHeaderView.ResizeMode.Interactive)
+
+        def _stretch_account():
+            total_width = lines_table.viewport().width()
+            other_width = sum(lines_table.columnWidth(i) for i in [COL_DEBIT, COL_CREDIT, COL_DELETE])
+            account_width = total_width - other_width - 15
+            if account_width > 150:
+                lines_table.setColumnWidth(COL_ACCOUNT, account_width)
+
+        QTimer.singleShot(0, _stretch_account)
 
         num_delegate = _NumericDelegate(lines_table)
         lines_table.setItemDelegateForColumn(COL_DEBIT, num_delegate)
@@ -2151,16 +2405,6 @@ class BudgetApp(QMainWindow):
 
         account_names = sorted(self.gl.accounts.keys())
 
-        def create_account_combo(account_name=None):
-            combo = QComboBox()
-            for name in account_names:
-                combo.addItem(name, name)
-            if account_name is not None:
-                idx = combo.findData(account_name)
-                if idx >= 0:
-                    combo.setCurrentIndex(idx)
-            return combo
-
         def create_amount_item(value):
             item = QTableWidgetItem(str(value))
             item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -2170,7 +2414,7 @@ class BudgetApp(QMainWindow):
             r = lines_table.rowCount()
             lines_table.insertRow(r)
 
-            acc_combo = create_account_combo(account)
+            acc_combo = self._create_account_combo(account)
             lines_table.setCellWidget(r, COL_ACCOUNT, acc_combo)
 
             lines_table.setItem(r, COL_DEBIT, create_amount_item(debit))
@@ -2286,7 +2530,7 @@ class BudgetApp(QMainWindow):
             QMessageBox.warning(self, "Transaction Not Updated", msg)
             return
 
-        QMessageBox.information(self, "Success", "Transaction updated.")
+        self.statusBar().showMessage("Transaction updated.", 3000)
         self.apply_transactions_tab_filters()
         self.apply_transaction_filters()
         self.refresh_overview()
@@ -2324,6 +2568,8 @@ class BudgetApp(QMainWindow):
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Add Transaction")
+        dlg.resize(700, 600)
+        dlg.setMinimumSize(500, 400)
         dlg_layout = QVBoxLayout(dlg)
 
         form = QFormLayout()
@@ -2339,11 +2585,39 @@ class BudgetApp(QMainWindow):
         lines_box = QGroupBox("Transaction Lines (Double-entry)")
         lines_layout = QVBoxLayout(lines_box)
 
+        legend_html = """
+        <span style='color:#2e7d32; font-weight:bold;'>■ Asset</span> &nbsp;&nbsp;
+        <span style='color:#c62828; font-weight:bold;'>■ Expense</span> &nbsp;&nbsp;
+        <span style='color:#1565c0; font-weight:bold;'>■ Equity</span> &nbsp;&nbsp;
+        <span style='color:#6a1b9a; font-weight:bold;'>■ Revenue</span> &nbsp;&nbsp;
+        <span style='color:#333333; font-weight:bold;'>■ Liability</span>
+        """
+        legend_label = QLabel(legend_html)
+        legend_label.setTextFormat(Qt.TextFormat.RichText)
+        legend_label.setStyleSheet("margin-bottom: 4px;")
+        lines_layout.addWidget(legend_label)
+
         lines_table = QTableWidget()
         lines_table.setColumnCount(4)
         lines_table.setHorizontalHeaderLabels(["Account", "Debit", "Credit", ""])
         lines_table.setRowCount(0)
         lines_table.setSortingEnabled(False)
+
+        header = lines_table.horizontalHeader()
+        header.setSectionResizeMode(COL_DEBIT, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(COL_CREDIT, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(COL_DELETE, QHeaderView.ResizeMode.Fixed)
+        lines_table.setColumnWidth(COL_DELETE, 120)
+        header.setSectionResizeMode(COL_ACCOUNT, QHeaderView.ResizeMode.Interactive)
+
+        def _stretch_account():
+            total_width = lines_table.viewport().width()
+            other_width = sum(lines_table.columnWidth(i) for i in [COL_DEBIT, COL_CREDIT, COL_DELETE])
+            account_width = total_width - other_width - 15
+            if account_width > 150:
+                lines_table.setColumnWidth(COL_ACCOUNT, account_width)
+
+        QTimer.singleShot(0, _stretch_account)
 
         num_delegate = _NumericDelegate(lines_table)
         lines_table.setItemDelegateForColumn(COL_DEBIT, num_delegate)
@@ -2362,17 +2636,6 @@ class BudgetApp(QMainWindow):
         totals_layout.addStretch()
         lines_layout.addLayout(totals_layout)
 
-        account_names = sorted(self.gl.accounts.keys())
-
-        def create_account_combo(account_name=None):
-            combo = QComboBox()
-            for name in account_names:
-                combo.addItem(name, name)
-            if account_name is not None:
-                idx = combo.findData(account_name)
-                if idx >= 0:
-                    combo.setCurrentIndex(idx)
-            return combo
 
         def create_amount_item(value):
             item = QTableWidgetItem(str(value))
@@ -2383,7 +2646,7 @@ class BudgetApp(QMainWindow):
             r = lines_table.rowCount()
             lines_table.insertRow(r)
 
-            acc_combo = create_account_combo(account)
+            acc_combo = self._create_account_combo(account)
             lines_table.setCellWidget(r, COL_ACCOUNT, acc_combo)
 
             lines_table.setItem(r, COL_DEBIT, create_amount_item(debit))
@@ -2484,7 +2747,7 @@ class BudgetApp(QMainWindow):
             QMessageBox.warning(self, "Transaction Not Added", msg)
             return
 
-        QMessageBox.information(self, "Success", "Transaction added.")
+        self.statusBar().showMessage("Transaction updated.", 3000)
         self.apply_transactions_tab_filters()
         self.apply_transaction_filters()
         self.refresh_overview()

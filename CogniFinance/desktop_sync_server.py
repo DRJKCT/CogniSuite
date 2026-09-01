@@ -1,6 +1,7 @@
 """
 CogniSync desktop HTTP server.
-Version 0.8 Debug version
+Version 1.0
+For CogniFinance ver 1.8
 
 Ephemeral LAN server that receives encrypted transaction batches from the
 Android companion app (MainActivity_dynamic_MN_timestamp_updated.kt) over the
@@ -992,7 +993,10 @@ class CogniSyncHandler(BaseHTTPRequestHandler):
 class CogniSyncServer(HTTPServer):
     """Ephemeral LAN HTTP server for mobile sync."""
 
-    def __init__(self, gl: GeneralLedger, pairing_code: str, port: int = 40317, bind_address: str = "0.0.0.0"):
+    def __init__(self, gl: GeneralLedger, pairing_code: str, port: int = 40317, bind_address: str = "0.0.0.0",
+        on_unknown_accounts: Optional[Callable[[list], None]] = None,
+        on_sync_completed: Optional[Callable[[], None]] = None,
+        **kwargs,):
         # Ensure sync activity (including rejection reasons never sent to the
         # phone) lands somewhere durable, even if the host app never calls
         # configure_file_logging() itself. Idempotent, so this is harmless
@@ -1022,6 +1026,8 @@ class CogniSyncServer(HTTPServer):
             desktop_identity=desktop_identity,
             trust_store=trust_store,
             peer_fingerprint=paired_phone_fingerprint,
+            on_unknown_accounts=on_unknown_accounts,
+            on_sync_completed=on_sync_completed,
         )
 
     @property

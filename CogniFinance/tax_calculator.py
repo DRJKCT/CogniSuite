@@ -1,5 +1,6 @@
 """
-tax_calculator.py
+tax_calculator.py ver 0.1
+For CogniFinanace ver 1.8
 Dynamic tax calculation using JSON templates from tax_templates/ folder.
 """
 import os

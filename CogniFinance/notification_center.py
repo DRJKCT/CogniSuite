@@ -1,4 +1,7 @@
 """
+notification_center.py ver 0.1
+For CogniFinance ver 1.8
+
 Notification backend: persisted state + the read/resolved distinction.
 
 Design principles (from the "weekly integrity test" conversation):
@@ -119,6 +122,14 @@ class NotificationCenter(QObject):
         self._items: list[Notification] = [
             Notification.from_dict(d) for d in self._store.load()
         ]
+        stale_sources = {"integrity_check_running", "integrity_check_complete"}
+        changed = False
+        for n in self._items:
+            if n.source in stale_sources and not n.resolved:
+                n.resolved = True
+                changed = True
+        if changed:
+            self._persist()
 
     # -- persistence --------------------------------------------------
 

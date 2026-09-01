@@ -1,4 +1,7 @@
 """
+notification_widgets.py ver 0.1
+For CogniFinance ver 1.8
+
 UI layer: a small always-present bell icon whose badge reflects
 `unresolved_count()`, and a popover panel listing individual
 notifications. Opening the panel marks items read (removes the "new"

@@ -1,4 +1,6 @@
 """
+passphrase_recovery.py ver 0.1
+For CogniFinance ver 1.8
 Passphrase strength checking and the recovery-passphrase safety net.
 
 How recovery works: SQLCipher only ever has one valid passphrase for a

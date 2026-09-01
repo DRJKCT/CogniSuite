@@ -1,4 +1,6 @@
-# tax_tab.py
+# tax_tab.py ver 0.1
+# For CogniFinance ver 1.8
+
 import os
 from decimal import Decimal
 from PyQt6.QtWidgets import (

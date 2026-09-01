@@ -53,7 +53,7 @@ Version 1.5
 
         1. (Structural) Verify main database (db) is complete and flush WAL (Write Ahead Logging) before backup db encryption to prevent dropped transacntions
         2. (Structural) Added WAL + busy timeout to the audit tab to prevent lock collison with the main program
-        3. (Functional) Sanitizes JSON template for illegal characters before exporting to .xlsx
+        3. (Functional) Sanitizes JSON template for illegal characters before exporting to .xlsx (include protect from basic code injection)
         4. (Architectural) Added support for OFX/QFX
         5. (Architectural) Added the ledger logic tax from the test suite to the start of the program as QProcess.  Integrity tests run weekly
         6. (Architectural) qtimer added to delay test start.  this ensures the program starts immediately for the user.
@@ -62,3 +62,88 @@ Version 1.5
         Fixed:
 
         1. (Functionsl) Fixed OS keyring failing silently and disbling on login screen
+
+Version 1.6
+
+    Added:
+
+        1. (Functional) Notification area added.  allowing messages to be displayed to users without the use of pop-ups
+        2. (Architectural) Timed Back-up (4 hours) added.  Also added back-up after successful mobile sync
+        3. (Architectural) Added automated systems check (test suite excluding ledger checks) that runs every 3 months
+        4. (Architectural) added a separate module (TestRunner Manager) to handle running the weekly and quarterly test.  It will also keep track of cooldowns through .json
+        5. (Functional) Added a pull-down menu for the tax liability estimator.  Allow .json templates for tax years and rates to be loaded.  All tax information can now be loaded in through json templates
+
+    Edits:
+
+        1. (UI/UX) User communications changed to the notification area
+
+    Verified all tests in the test suite works with current version of the program
+
+Version 1.7
+
+    Added:
+
+        1. (Functional) Disabling the sync button in mobile tab during automated tests to prevent conflicts (tested)
+
+    Removed:
+
+        1. (Architectural) Start process of rewriting the add/edit tab, moving math validation completely out of the UI.  Major architectural flaw having any math validation conducted within the ui_main.py.  Math validation moved to ledger.py (consistent with rest of design)
+
+Version 1.8
+
+    Added:
+
+        1. (Architectural) Added a reconcilliation step when importing statements (ofx/qfx/pdf), which uses fuzzy heuristics to match duplicate statement entries and mobile pending entries.  returns a 3 tier match list for user to manually verify (choose between consolidate into one entry or keep as 2)
+            1.1 (Functional) Fixed OFX import returning unfiltered transaction list instead of deduplicated list, causing duplicates to bypass the suggested matches dialog entirely
+            1.2 (Functional) Fixed OFX transactions silently skipping fuzzy duplicate detection because parsed_tx_to_candidate expected a top-level 'amount' key that only the PDF parser provides. Now calculates amount from the 'lines' array as fallback
+        2. (UI/UX) Added visual progress bar (QProgressDialog) for both PDF and OFX imports with real-time file and transaction count updates
+        3. (UI/UX) Replaced text-based tier labels in Suggested Matches dialog with colored circle indicators (green/amber/red) for faster visual parsing
+        4. (UI/UX) Added 'Date Diff' and 'Merchant Match' columns to Suggested Matches dialog so users can see exactly why a match dropped from green to yellow tier
+        5. (UI/UX) Added color-coded merchant similarity percentages and hover tooltips explaining match confidence reasoning
+        6. (UI/UX) Made Suggested Matches dialog columns user-adjustable via interactive header resizing
+
+    Fixed:
+
+        1. (Architectural) Fixed 'Not Responding' title bar and UI freeze during OFX imports by moving parsing and database writes to a background QThread and added a progress bar for import
+
+Version 1.9
+
+    Fixed:
+
+        1. (Functional) Fixed notification accumulation bug where old 'integrity_check_complete' notifications persisted across app restarts and reappeared in the bell badge. Added stale source auto-resolve on startup and clear_resolved() pruning
+        2. (Functional) Fixed notification spam caused by 30-second sync polling loop creating a new 'Integrity Checks Complete' notification every cycle even when no audits were due. Suppressed notification for 'No audits currently due' messages
+        3. (Functional) Fixed TestRunnerManager silent crash caused by undefined CONFIG_PATH variable in _set_infra_failures. Would have left sync button permanently disabled if deep audit infrastructure failed
+        4. (Functional) Fixed race condition crash (NoneType AttributeError) in progress dialog updater when background thread emitted late signals after dialog was already closed
+        5. (Functional) Fixed test_encrypted_backup_and_restore cascading failure caused by test suite still using old 3-tuple format for update_transaction calls. Updated all four test files to use new 4-tuple signature (line_id, account, dr, cr)
+        6. (UI/UX) Fixed Add/Edit tab displaying `0.00` for pure Asset-to-Asset transfers by reusing the robust `_transaction_display_amount` fallback method instead of hardcoded Expense/Revenue logic.
+        7. (UI/UX) Fixed "Delete" button text clipping in the Add/Edit transaction dialog by locking the column to a fixed width of 120px.
+        8. (UI/UX) Fixed Add/Edit tab displaying `0.00` for pure Asset-to-Asset transfers by replacing hardcoded Expense/Revenue logic with the robust `_transaction_display_amount` fallback method.
+        9.. (UI/UX) Fixed "Delete" button text clipping in the Add/Edit transaction dialogs by locking the column to a fixed width of 120px.
+        10. (UI/UX) Fixed Add/Edit transaction dialogs opening too small by setting explicit initial (700x600) and minimum (500x400) window sizes.
+        11. (Functional) Fixed `AttributeError` crashes caused by orphaned references to the old Category Rules methods in `ui_main.py` (specifically in `refresh_account_combos` and `edit_selected_account`).
+        12. (Functional) Fixed `KeyError` crashes in `_transaction_display_amount` when rendering historical transactions that reference deleted or renamed accounts by using defensive `.get()` lookups.
+        13. (Functional) Fixed OFX import pipeline completely bypassing Category Rules, causing all OFX imports to default to Uncategorized accounts. Now correctly queries the rule engine before falling back.
+        14. (Functional) Fixed OFX import double-credit bug for Liability inflows that would have created mathematically unbalanced ledger entries.
+        15. (Functional) Fixed Reconciliation Matcher falsely identifying recurring monthly subscriptions as duplicates by enforcing a hard 14-day maximum date window (`MAX_DATE_WINDOW_DAYS`).
+        16. (UI/UX) Fixed Charts tab layout issues, including gigantic vertical spacing and dropdown text cutoff, by applying strict size policies and reducing layout margins.
+        17. (UI/UX) Fixed Charts tab "Current Month" view rendering as a single point by implementing dynamic X-axis grouping (daily for <= 31 days, monthly for longer ranges).
+
+
+
+    Added:
+
+        1. (Functional) Added account editing feature to Accounts tab allowing safe rename and type change with automatic cascading updates to all historical transactions, budgets, and category rules
+        2. (Architectural) Extracted Category Rules tab into dedicated category_rules_tab.py module to reduce ui_main.py complexity
+        3. (Architectural) Created graphs.py module with ChartFactory and ChartsTab replacing the basic single-chart tab. Includes five chart types: Income vs Expenses line chart, Expense Breakdown donut chart, Net Worth Trend, Top 10 Spending Categories horizontal bar chart, and Year-over-Year grouped bar comparison
+        4. (UI/UX) Added color-coded account dropdowns in the Add/Edit transaction dialogs, utilizing a custom `QStyledItemDelegate` with a `paint()` override to guarantee color rendering across all OS themes, complete with an HTML legend.
+        5. (UI/UX) Added smart column resizing to the Add/Edit transaction dialogs: the Account column fills available space initially but remains user-adjustable, while Debit/Credit columns tightly fit their contents.
+        6. (UI/UX) Set explicit initial and minimum window sizes for the Add/Edit transaction dialogs to prevent them from opening too small.
+        7. (UI/UX) Replaced blocking "Success" popups with non-blocking status bar messages when adding/editing transactions, streamlining batch-entry workflows while retaining blocking popups for errors.
+        8. (Architectural) Upgraded Charts tab (`graphs.py`) to support flexible timeframes (Current Month, Current Year, Custom Range) and added a Category filter for Year-over-Year comparisons.
+
+
+
+    Edits:
+        1. (Functional) Removed artificial 'Expense only' restriction on Category Rules. Rules can now target any account type (Asset, Liability, Equity, Revenue, Expense) enabling automatic routing of transfers and misrouted imports
+        2. (UI/UX) Budget category dropdown remains Expense-only since budgeting only applies to expenses, while Category Rules dropdown now shows all accounts
+        3. (Functional) Updated `_process_confirmed_matches` to handle Bank-to-Bank merges by marking the existing transaction as reconciled and discarding the duplicate import, rather than attempting to overwrite mobile app categorizations.

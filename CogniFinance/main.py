@@ -1,3 +1,6 @@
+# main.py ver 0.1
+# For CogniFinance ver 1.8
+
 import os
 import sys
 import json

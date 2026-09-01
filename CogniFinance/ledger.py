@@ -1,3 +1,6 @@
+#Ledger v1.1 redesigned update_transaction, delete_transaction, added reassign_account for the new add/edit tab
+#For CogniFinance ver 1.8
+
 import os
 import glob
 import json
@@ -10,7 +13,6 @@ from datetime import datetime
 from sqlcipher3 import dbapi2 as sqlite3
 from calendar import monthrange
 
-#Ledger v1.0 added actionable logging
 
 # Currency Constants and Helper
 ZERO = Decimal("0.00")
@@ -404,6 +406,67 @@ class GeneralLedger:
         finally:
             conn.close()
 
+    def update_account(self, old_name: str, new_name: str, new_type: str) -> Tuple[bool, str]:
+        """Renames and/or changes the type of an account, cascading updates to history, budgets, and rules."""
+        if old_name not in self.accounts:
+            return False, "Account does not exist."
+        if not new_name.strip():
+            return False, "Account name cannot be empty."
+        if new_name != old_name and new_name in self.accounts:
+            return False, "An account with that name already exists."
+
+        acc = self.accounts[old_name]
+        name_changed = new_name != old_name
+        type_changed = new_type != acc.account_type
+
+        if not name_changed and not type_changed:
+            return True, "No changes made."
+
+        conn, cur = self._connect()
+        try:
+            if name_changed:
+                # Cascade the rename across all related tables
+                cur.execute("UPDATE sql_accounts SET name = ? WHERE name = ?", (new_name, old_name))
+                cur.execute("UPDATE sql_transaction_lines SET account_name = ? WHERE account_name = ?", (new_name, old_name))
+                cur.execute("UPDATE sql_budgets SET category = ? WHERE category = ?", (new_name, old_name))
+                cur.execute("UPDATE sql_category_rules SET category = ? WHERE category = ?", (new_name, old_name))
+
+            if type_changed:
+                target_name = new_name if name_changed else old_name
+                cur.execute("UPDATE sql_accounts SET account_type = ? WHERE name = ?", (new_type, target_name))
+
+            conn.commit()
+
+            # Update in-memory state
+            if name_changed:
+                acc = self.accounts.pop(old_name)
+                self.accounts[new_name] = acc
+                acc.name = new_name
+
+                # Update budgets dictionary keys
+                new_budgets = {}
+                for (cat, month), b in self.budgets.items():
+                    if cat == old_name:
+                        new_budgets[(new_name, month)] = Budget(new_name, month, b.amount)
+                    else:
+                        new_budgets[(cat, month)] = b
+                self.budgets = new_budgets
+
+                # Update rules in memory
+                for rule in self.category_rules:
+                    if rule.category == old_name:
+                        rule.category = new_name
+
+            if type_changed:
+                acc.account_type = new_type
+
+            return True, "Account updated."
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+        finally:
+            conn.close()
+
     def record_transaction(self, date: str, description: str, lines_data: List[Tuple[str, Any, Any]], imported_id: Optional[str] = None, persist: bool = True) -> Tuple[bool, str]:
         try:
             datetime.strptime(date, "%Y-%m-%d")
@@ -764,8 +827,6 @@ class GeneralLedger:
     def add_category_rule(self, keyword: str, category: str, case_sensitive: bool = False, enabled: bool = True) -> Tuple[bool, str]:
         if category not in self.accounts:
             return False, f"Category '{category}' does not exist."
-        if self.accounts[category].account_type != "Expense":
-            return False, "Category must be an Expense account."
         conn, cur = self._connect()
         try:
             cur.execute("INSERT INTO sql_category_rules (keyword, category, case_sensitive, enabled) VALUES (?, ?, ?, ?)", (keyword, category, 1 if case_sensitive else 0, 1 if enabled else 0))

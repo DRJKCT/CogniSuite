@@ -1,4 +1,6 @@
-# TestRunnerManager.py
+# TestRunnerManager.py ver 0.1
+# CogniFinance ver 1.8
+
 import sys
 import os
 import json
@@ -103,8 +105,8 @@ class TestRunnerManager(QObject):
 
         data["deep_infra_failures"] = count
         try:
-            os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+            with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
             self.log_output.emit(f"Warning: Could not save failure counter: {e}")

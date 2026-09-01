@@ -1,4 +1,6 @@
-# log_tab.py
+# log_tab.py v0.1
+# For CogniFinance ver 1.8
+
 import os
 import logging
 from datetime import datetime

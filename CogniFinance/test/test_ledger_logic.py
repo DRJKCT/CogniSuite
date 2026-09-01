@@ -36,7 +36,7 @@ def test_audit_trail_on_edit(temp_ledger):
     tx_id = temp_ledger.transactions[-1].id
 
     # Edit the transaction to $15
-    new_lines = [("Checking Account", 0, 15), ("Groceries", 15, 0)]
+    new_lines = [(None, "Checking Account", 0, 15), (None, "Groceries", 15, 0)]
     temp_ledger.update_transaction(tx_id, "2026-01-01", "Updated", new_lines)
 
     history = temp_ledger.get_transaction_history(tx_id)
