@@ -40,6 +40,7 @@ from ofx_import import parse_ofx_to_ledger_transactions, OFXImportThread
 from TestRunnerManager import TestRunnerManager
 from graphs import ChartsTab
 from category_rules_tab import CategoryRulesTab
+from backup_manager import BackupManager
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -181,6 +182,7 @@ class BudgetApp(QMainWindow):
         store_path = Path(self.db_dir) / "notifications.json"
         self.notifications = NotificationCenter(NotificationStore(store_path))
         self.notifications.clear_resolved()
+        self.backup_manager = BackupManager(self.db_dir)
 
         # Mobile sync state.
         self.sync_server = None
@@ -867,11 +869,17 @@ class BudgetApp(QMainWindow):
 
         btn_import_ofx = QPushButton("Import OFX/QFX (Bank Feed)")
         btn_import_ofx.clicked.connect(self.import_ofx_qfx)
-
+        btn_manual_backup = QPushButton("Manual Backup to External Drive")
+        btn_manual_backup.clicked.connect(self.manual_external_backup)
         btn_row.addWidget(self.btn_import_pdf)
         btn_row.addWidget(btn_import_ofx)
         btn_row.addWidget(btn_import)
         btn_row.addWidget(btn_export)
+        btn_row.addWidget(btn_manual_backup)
+        btn_restore = QPushButton("Restore from Backup")
+        btn_restore.clicked.connect(self.restore_from_backup)
+        btn_restore.setStyleSheet("color: #c62828; font-weight: bold;")
+        btn_row.addWidget(btn_restore)
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
@@ -939,6 +947,11 @@ class BudgetApp(QMainWindow):
         unreconciled_count = len(self.gl.get_unreconciled_transactions())
         reconciliation_rows = [f"<tr><td>{unreconciled_count} unreconciled transaction(s)</td></tr>"]
 
+        # Backup health indicator
+        backup_color, backup_msg = self.backup_manager.get_backup_health(len(self.gl.transactions))
+        backup_circle = f'<font color="{backup_color}" size="4">●</font>&nbsp;&nbsp;'
+        backup_rows = [f"<tr><td>{backup_circle}{backup_msg}</td></tr>"]
+
         html = f"""
         <html>
         <body style="font-family: 'Segoe UI', sans-serif; font-size: 10pt;">
@@ -963,6 +976,9 @@ class BudgetApp(QMainWindow):
             <br>
             {section("Reconciliation")}
             {table(reconciliation_rows)}
+            <br>
+            {section("Backup Status")}
+            {table(backup_rows)}
             <br>
             {section("Recent Transactions")}
             <table width="100%" cellspacing="0" cellpadding="2">
@@ -2276,6 +2292,62 @@ class BudgetApp(QMainWindow):
                 f"but not backed up to disk. Error: {e}",
                 "backup_failure"
             )
+
+    def manual_external_backup(self):
+        """UI wrapper for manual external backup."""
+        timestamp = datetime.now().strftime("%Y-%m-%d")
+        default_name = f"cognifinance_manual_backup_{timestamp}.db"
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Encrypted Backup", default_name,
+            "Database Files (*.db);;All Files (*)"
+        )
+        if not path:
+            return
+
+        success, msg = self.backup_manager.execute_manual_backup(self.gl, path)
+
+        if success:
+            self.refresh_overview()
+            QMessageBox.information(self, "Backup Successful", f"Encrypted backup saved to:\n{msg}")
+        else:
+            QMessageBox.critical(self, "Backup Failed", f"Could not save backup:\n{msg}")
+
+    def restore_from_backup(self):
+        """UI wrapper for database restore."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Backup to Restore", "",
+            "Database Files (*.db *.cfb);;All Files (*)"
+        )
+        if not path:
+            return
+
+        reply = QMessageBox.warning(
+            self, "Confirm Restore",
+            "Restoring from a backup will OVERWRITE your current database.\n\n"
+            "The app will close your current database and force a restart.\n\n"
+            "WARNING: Ensure the backup was created with the SAME passphrase.\n\n"
+            "Are you sure you want to continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        success, msg = self.backup_manager.execute_restore(self.gl, path)
+
+        if success:
+            QMessageBox.information(
+                self, "Restore Successful",
+                "The database has been successfully restored.\n\n"
+                "CogniFinance will now close. Please reopen the application "
+                "to load your restored data."
+            )
+            # Gracefully shut down background threads before quitting
+            self.stop_mobile_sync()
+            QApplication.instance().quit()
+        else:
+            QMessageBox.critical(self, "Restore Failed", msg)
 
     def closeEvent(self, event):
         if hasattr(self, 'test_manager'):

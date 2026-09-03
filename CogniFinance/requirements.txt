@@ -1,3 +1,10 @@
 cryptography>=42
 pytest>=8
 spake2>=0.9
+PyQt6
+matplotlib
+pandas
+openpyxl
+qrcode
+ofxparse
+
