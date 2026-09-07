@@ -8,12 +8,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ledger import GeneralLedger
 
+DUMMY_DEK_HEX = os.urandom(32).hex()
+
 @pytest.fixture
 def temp_ledger():
     """Creates a fresh, empty, encrypted SQLCipher database in a temporary directory."""
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_ledger.db")
-        gl = GeneralLedger(db_path, "TestPassphrase123!")
+        gl = GeneralLedger(db_path, DUMMY_DEK_HEX)
         yield gl
 
 # ==========================================
@@ -150,7 +152,7 @@ def test_encrypted_backup_and_restore(temp_ledger):
 
         # 3. Restore (Open the backup as a brand new GeneralLedger instance)
         # It MUST require the original passphrase to unlock
-        restored_ledger = GeneralLedger(backup_path, "TestPassphrase123!")
+        restored_ledger = GeneralLedger(backup_path, DUMMY_DEK_HEX)
 
         # 4. Verify data integrity
         assert len(restored_ledger.transactions) == original_tx_count
@@ -159,7 +161,7 @@ def test_encrypted_backup_and_restore(temp_ledger):
         # 5. Verify Audit History survives the backup
         # Edit a transaction in the original ledger
         tx_id = temp_ledger.transactions[-1].id
-        temp_ledger.update_transaction(
+        temp_ledger.edit_transaction(
             tx_id, "2026-01-02", "Updated Groceries",
             [(None, "Groceries", 60, 0), (None, "Checking Account", 0, 60)]
         )
@@ -169,9 +171,9 @@ def test_encrypted_backup_and_restore(temp_ledger):
         temp_ledger.create_encrypted_backup(backup_path_2)
 
         # Restore and check history
-        restored_ledger_2 = GeneralLedger(backup_path_2, "TestPassphrase123!")
+        restored_ledger_2 = GeneralLedger(backup_path_2, DUMMY_DEK_HEX)
         history = restored_ledger_2.get_transaction_history(tx_id)
 
         assert len(history) == 2
         assert history[0]["change_type"] == "created"
-        assert history[1]["change_type"] == "updated"
+        assert history[1]["change_type"] == "voided"

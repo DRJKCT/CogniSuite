@@ -1,11 +1,13 @@
-# deep_integrity_checker.py ver 0.1
-# For CogniFinance ver 1.8
+# deep_integrity_checker.py ver 0.2
+# For CogniFinance ver 1.95
 
 import os
 import sys
 import json
 import time
 from PyQt6.QtCore import QObject, QProcess, QProcessEnvironment, pyqtSignal
+from config import DEEP_COOLDOWN_PATH
+from config import atomic_secure_write_json
 
 class DeepIntegrityChecker(QObject):
     """
@@ -15,9 +17,11 @@ class DeepIntegrityChecker(QObject):
     log_output = pyqtSignal(str)
     finished_signal = pyqtSignal(int, str)  # (exit_code: int, summary: str)
 
-    def __init__(self, test_dir: str):
+    def __init__(self, test_dir: str, db_dir: str, dek_hex: str):
         super().__init__()
         self.test_dir = test_dir
+        self.db_dir = db_dir
+        self.dek_hex = dek_hex
 
         self.weekly_files_to_ignore = [
             os.path.join(test_dir, "test_core_finance.py"),
@@ -43,6 +47,9 @@ class DeepIntegrityChecker(QObject):
 
         env = QProcessEnvironment.systemEnvironment()
         env.insert("PYTHONUNBUFFERED", "1")
+        db_path = os.path.join(self.db_dir, "ledger_storage.db")
+        env.insert("COGNIFINANCE_DB_PATH", db_path)
+        env.insert("COGNIFINANCE_DB_PASSPHRASE", self.dek_hex)
         self.process.setProcessEnvironment(env)
 
         self.log_output.emit("Starting QUARTERLY deep security and structural checks...")
@@ -84,7 +91,7 @@ class DeepIntegrityChecker(QObject):
 # Deep Cooldown Management
 # =====================================================================
 def get_deep_cooldown_path(db_dir: str) -> str:
-    return os.path.join(db_dir, ".deep_integrity_cooldown.json")
+    return str(DEEP_COOLDOWN_PATH)
 
 def should_run_deep_check(db_dir: str, cooldown_days: int = 90) -> bool:
     path = get_deep_cooldown_path(db_dir)
@@ -99,10 +106,10 @@ def should_run_deep_check(db_dir: str, cooldown_days: int = 90) -> bool:
         return True
 
 def save_deep_cooldown_timestamp(db_dir: str):
-    path = get_deep_cooldown_path(db_dir)
     try:
-        os.makedirs(db_dir, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump({"last_run": time.time()}, f)
+        atomic_secure_write_json(
+            DEEP_COOLDOWN_PATH,
+            {"last_run": time.time()},
+        )
     except Exception:
         pass

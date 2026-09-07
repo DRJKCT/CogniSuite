@@ -23,7 +23,8 @@ def temp_ledger():
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_ledger.db")
         # Initialize with a standard test passphrase
-        gl = GeneralLedger(db_path, "TestPassphrase123!")
+        test_dek_hex = os.urandom(32).hex()
+        gl = GeneralLedger(db_path, test_dek_hex)
 
         # Explicitly create default accounts to ensure tests are isolated
         # and don't rely on hidden auto-creation logic.
@@ -150,7 +151,7 @@ def test_edit_preserves_old_state_in_history(temp_ledger):
 
     # 2. Edit the transaction to $15.00
     new_lines = [(None, "Checking Account", 0, 15.00), (None, "Groceries", 15.00, 0)]
-    ok2, msg2 = temp_ledger.update_transaction(tx_id, "2026-01-01", "Updated Dinner", new_lines)
+    ok2, msg2 = temp_ledger.edit_transaction(tx_id, "2026-01-01", "Updated Dinner", new_lines)
     assert ok2 is True, f"Update failed: {msg2}"
 
     # 3. Inspect the Audit Log
@@ -158,7 +159,9 @@ def test_edit_preserves_old_state_in_history(temp_ledger):
     assert len(history) == 2, f"Expected 2 history entries, got {len(history)}" # 1 for 'created', 1 for 'updated'
 
     updated_record = history[1]
-    assert updated_record["change_type"] == "updated"
+    # Append-only edit: the original tx is marked "voided", not "updated" --
+    # the new values live in a separate tx id's own "created" entry.
+    assert updated_record["change_type"] == "voided"
 
     # The history payload should contain the OLD lines ($10.00), not the new ones ($15.00)
     old_lines = updated_record["lines"]

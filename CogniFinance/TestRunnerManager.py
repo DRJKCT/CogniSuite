@@ -1,5 +1,5 @@
-# TestRunnerManager.py ver 0.1
-# CogniFinance ver 1.8
+# TestRunnerManager.py ver 0.2
+# CogniFinance ver 1.95
 
 import sys
 import os
@@ -9,18 +9,26 @@ from PyQt6.QtCore import QObject, QProcess, pyqtSignal
 
 from integrity_checker import IntegrityChecker, should_run_integrity_check, save_cooldown_timestamp
 from deep_integrity_checker import DeepIntegrityChecker, should_run_deep_check, save_deep_cooldown_timestamp
+from config import AUDIT_CONFIG_PATH
+from config import atomic_secure_write_json
+from supply_chain_auditor import SupplyChainAuditor
 
 DEEP_AUDIT_INTERVAL_DAYS = 90
 
 class TestRunnerManager(QObject):
     audit_completed = pyqtSignal(bool, str)  # (success: bool, message: str)
     log_output = pyqtSignal(str)             # Streams test output to the UI
+    supply_chain_warning = pyqtSignal(int, int, list) # (total, critical, details)
 
-    def __init__(self, db_dir: str, test_dir: str, parent=None):
+
+    def __init__(self, db_dir: str, test_dir: str, requirements_path, dek_hex: str, parent=None):
         super().__init__(parent)
         self.db_dir = db_dir
         self.test_dir = test_dir
-        self.config_path = os.path.join(self.db_dir, ".cognifinance_audit.json")
+        self.config_path = str(AUDIT_CONFIG_PATH)
+        self.requirements_path = requirements_path
+        self.dek_hex = dek_hex
+        self.supply_chain_auditor = None
         self.weekly_checker = None
         self.deep_checker = None
 
@@ -43,7 +51,41 @@ class TestRunnerManager(QObject):
             self.log_output.emit(" -> Deep Structural/Security Suite (Due)")
         self.log_output.emit("=" * 50)
 
-        self._run_weekly_tests(run_deep_after=run_deep)
+        if run_deep:
+            # Supply chain audit only runs alongside the deep/quarterly suite,
+            # not on every weekly cycle.
+            self._run_supply_chain_audit(run_weekly_after=run_weekly)
+        elif run_weekly:
+            self._run_weekly_tests(run_deep_after=False)
+
+    def _run_supply_chain_audit(self, run_weekly_after: bool):
+        self.log_output.emit("Step 0: Running Supply Chain Vulnerability Audit...")
+        self.supply_chain_auditor = SupplyChainAuditor(self.requirements_path)
+        self.supply_chain_auditor.log_output.connect(self.log_output.emit)
+
+        # Connect to a new handler that decides what to do next
+        self.supply_chain_auditor.audit_finished.connect(
+            lambda total, crit, details: self._on_supply_chain_finished(total, crit, details, run_weekly_after, run_deep_after)
+        )
+        self.supply_chain_auditor.start()
+
+    def _on_supply_chain_finished(self, total_vulns: int, critical_vulns: int, details: list, run_weekly: bool, run_deep: bool):
+        if total_vulns == -1:
+            self.log_output.emit("⚠️ Supply chain audit skipped or failed (offline?). Proceeding to code audits.")
+        elif total_vulns > 0:
+            self.log_output.emit(f"⚠️ WARNING: {total_vulns} vulnerable dependencies found. Please update requirements.txt.")
+            # Emit signal so ui_main.py can push this to the NotificationCenter
+            self.supply_chain_warning.emit(total_vulns, critical_vulns, details)
+        else:
+            self.log_output.emit("✅ Supply chain is clean.")
+
+        # Proceed to the rest of the audit sequence
+        if run_weekly:
+            self._run_weekly_tests(run_deep_after=run_deep)
+        elif run_deep:
+            self._run_deep_audit()
+        else:
+            self.audit_completed.emit(True, "No code audits currently due.")
 
     def _run_weekly_tests(self, run_deep_after: bool):
         """Step 1: Launch weekly ledger invariant test."""
@@ -77,7 +119,7 @@ class TestRunnerManager(QObject):
     def _run_deep_audit(self):
         """Step 2: Launch deep structural/crypto test suite."""
         self.log_output.emit("Starting Deep Structural/Security Suite...")
-        self.deep_checker = DeepIntegrityChecker(self.test_dir)
+        self.deep_checker = DeepIntegrityChecker(self.test_dir,  self.db_dir, self.dek_hex)
         self.deep_checker.log_output.connect(self.log_output.emit)
         self.deep_checker.finished_signal.connect(self._on_deep_audit_finished)
         self.deep_checker.start()
@@ -105,9 +147,7 @@ class TestRunnerManager(QObject):
 
         data["deep_infra_failures"] = count
         try:
-            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            atomic_secure_write_json(self.config_path, data)
         except Exception as e:
             self.log_output.emit(f"Warning: Could not save failure counter: {e}")
 
@@ -164,6 +204,8 @@ class TestRunnerManager(QObject):
 
     def cleanup(self):
         """Ensures subprocesses don't orphan if the app closes mid-test."""
+        processes_to_check = [self.weekly_checker, self.deep_checker, self.supply_chain_auditor]
+
         for checker in (self.weekly_checker, self.deep_checker):
             if checker and hasattr(checker, 'process') and checker.process.state() != QProcess.ProcessState.NotRunning:
                 checker.process.terminate()

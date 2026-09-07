@@ -1,5 +1,5 @@
-# ui_main.py ver 0.5 Changed add/edit tab to remove accounting logic within ui_main.  Removed all math validation and left it to ledger.py
-# For CogniFinance ver 1.8
+# ui_main.py ver 1.1 Refactored to remove majority of functions not related to UI
+# For CogniFinance ver 1.95
 
 import os
 import io
@@ -32,8 +32,6 @@ from decimal import Decimal
 from notification_center import NotificationCenter, NotificationStore, Severity
 from notification_widgets import NotificationBell
 
-from desktop_sync_server import CogniSyncServer
-from protocol import make_pairing_code
 from log_tab import LogTab
 from audit_tab import AuditTab
 from tax_tab import TaxTab
@@ -51,6 +49,10 @@ from ui_transactions_tab import TransactionsTab
 from budgets_tab import BudgetsTab
 from add_edit_tab import AddEditTab
 from import_manager import ImportManager
+from sync_tab import SyncTab
+from reports_tab import ReportsTab
+from reconcile_tab import ReconcileTab
+from config import NOTIFICATIONS_PATH, BACKUP_DIR
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -59,12 +61,12 @@ logger = logging.getLogger(__name__)
 
 class BudgetApp(QMainWindow):
 
-    def __init__(self, db_path: str, passphrase: str):
+    def __init__(self, db_path: str, dek_hex: str):
         super().__init__()
-        self.gl = GeneralLedger(db_path, passphrase)
+        self.gl = GeneralLedger(db_path, dek_hex)
         self._tx_table_id_map = {}
         self.db_dir = os.path.dirname(self.gl.db_path)
-        store_path = Path(self.db_dir) / "notifications.json"
+        store_path = NOTIFICATIONS_PATH
         self.notifications = NotificationCenter(NotificationStore(store_path))
         self.notifications.clear_resolved()
         self.backup_manager = BackupManager(self.db_dir)
@@ -72,9 +74,6 @@ class BudgetApp(QMainWindow):
         self.import_manager.data_imported.connect(self._refresh_all_data)
 
         # Mobile sync state.
-        self.sync_server = None
-        self.sync_thread = None
-        self.sync_status_timer = None
         self.setWindowTitle("CogniFinance")
         self.resize(1100, 750)
 
@@ -88,19 +87,19 @@ class BudgetApp(QMainWindow):
         root.addWidget(self.tabs)
 
         self.tab_overview = QWidget()
-        self.tab_reconcile = QWidget()
+        self.tab_reconcile = ReconcileTab(self.gl)
         self.tab_transactions = TransactionsTab(self.gl)
         self.tab_transactions2 = AddEditTab(self.gl)
         self.tab_budgets = BudgetsTab(self.gl)
         self.tab_charts = ChartsTab(self.gl)
-        self.tab_reports = QWidget()
+        self.tab_reports = ReportsTab(self.gl)
         self.tab_accounts = QWidget()
         self.tab_balance = QWidget()
         self.tab_rules = CategoryRulesTab(self.gl)
         self.tab_taxes = TaxTab(self.gl)
-        self.tab_sync = QWidget()
+        self.tab_sync = SyncTab(self.gl)
         self.tab_log = LogTab()
-        self.tab_audit = AuditTab(db_path=self.gl.db_path, passphrase=self.gl.passphrase)
+        self.tab_audit = AuditTab(db_path=self.gl.db_path, dek_hex=self.gl.dek_hex)
 
         self.tabs.addTab(self.tab_overview, "Overview")
         self.tabs.addTab(self.tab_reconcile, "Reconciliation")
@@ -121,19 +120,23 @@ class BudgetApp(QMainWindow):
         self.tab_transactions2.history_requested.connect(self.tab_audit.show_history_for_tx_id)
         self.tab_transactions2.data_modified.connect(self._refresh_all_data)
 
+        self.tab_sync.data_synced.connect(self._refresh_all_data)
+
         self._init_overview()
-        self._init_reconcile()
-        self._init_reports_tab()
         self._init_accounts()
         self._init_balance_sheet()
-        self._init_sync_tab()
 
         logging.getLogger().addHandler(self.tab_log.log_handler)
 
-        test_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test")
-        self.test_manager = TestRunnerManager(self.db_dir, test_dir, self)
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        test_dir = os.path.join(base_dir, "test")
+        req_path = os.path.join(base_dir, "requirements.txt")
+
+        self.test_manager = TestRunnerManager(self.db_dir, test_dir, req_path, self.gl.dek_hex, self)
         self.test_manager.log_output.connect(self._log_audit_message)
         self.test_manager.audit_completed.connect(self._on_audit_completed)
+        self.test_manager.supply_chain_warning.connect(self._handle_supply_chain_warning)
+
 
         QTimer.singleShot(5000, self._start_audit_sequence)
 
@@ -158,8 +161,7 @@ class BudgetApp(QMainWindow):
             self.statusBar().showMessage("Integrity audit deferred: Mobile sync currently active.", 4000)
             return
 
-        self.sync_start_button.setEnabled(False)
-        self.sync_start_button.setToolTip("Sync temporarily locked: Background system audit in progress (~1 min).")
+        self.tab_sync.set_start_button_enabled(False)
 
         self.notifications.add(
             Severity.INFO,
@@ -169,6 +171,20 @@ class BudgetApp(QMainWindow):
             "integrity_check_running"
         )
         self.test_manager.start_scheduled_audit()
+
+    def _handle_supply_chain_warning(self, total: int, critical: int, details: list):
+        """Routes pip-audit findings to the Notification Center."""
+        if critical > 0:
+            severity = Severity.CRITICAL
+            title = "Critical Supply Chain Vulnerabilities Detected"
+            msg = (f"{critical} dependencies have critical vulnerabilities with no available patch. "
+                f"({total} total vulnerabilities found). Please review the Log Tab and update dependencies immediately.")
+        else:
+            severity = Severity.WARNING
+            title = "Dependency Vulnerabilities Found"
+            msg = f"{total} dependencies have known vulnerabilities. Please run 'pip-audit' and update your requirements.txt."
+
+        self.notifications.add(severity, title, msg, "supply_chain_audit")
 
     def _log_audit_message(self, message: str):
         """Routes the test output directly into the Log Tab."""
@@ -192,8 +208,7 @@ class BudgetApp(QMainWindow):
     def _on_audit_completed(self, success: bool, message: str):
         """Called when the entire audit sequence (Weekly + Deep) finishes."""
         self.notifications.resolve("integrity_check_running")
-        self.sync_start_button.setEnabled(True)
-        self.sync_start_button.setToolTip("Start Mobile Sync")
+        self.tab_sync.set_start_button_enabled(True)
 
         if success:
             if "No audits currently due" not in message:
@@ -232,8 +247,8 @@ class BudgetApp(QMainWindow):
             self.tab_transactions2: self.tab_transactions2.refresh_data,
             self.tab_budgets: self.tab_budgets.refresh_budget_list,
             self.tab_charts: self.tab_charts.refresh_charts,
-            self.tab_reports: self.refresh_monthly_report,
-            self.tab_reconcile: self.load_unreconciled,
+            self.tab_reports: self.tab_reports.refresh_data,
+            self.tab_reconcile: self.tab_reconcile.refresh_data,
             self.tab_balance: self.refresh_balance_sheet,
             self.tab_taxes: self.tab_taxes.refresh_summary,
             self.tab_audit: self.tab_audit.refresh,
@@ -252,7 +267,6 @@ class BudgetApp(QMainWindow):
     def _refresh_all_data(self):
         """Master refresh triggered when data is modified in a tab."""
         self.tab_transactions.refresh_data()
-        self.apply_transactions_tab_filters()
         self.refresh_overview()
         self.refresh_accounts_table()
         if hasattr(self, 'tab_budgets'):
@@ -284,11 +298,14 @@ class BudgetApp(QMainWindow):
         info.setWordWrap(True)
         layout.addWidget(info)
 
+        accounts_box = QGroupBox("Chart of Accounts")
+        box_layout = QVBoxLayout(accounts_box)
+
         self.accounts_table = QTableWidget()
         self.accounts_table.setColumnCount(2)
         self.accounts_table.setHorizontalHeaderLabels(["Account Name", "Type"])
         setup_table_headers(self.accounts_table, [0.7, 0.3])
-        layout.addWidget(self.accounts_table)
+        box_layout.addWidget(self.accounts_table)
 
         btn_row = QHBoxLayout()
         btn_add = QPushButton("Add New Account")
@@ -302,7 +319,9 @@ class BudgetApp(QMainWindow):
         btn_row.addWidget(btn_edit)
         btn_row.addWidget(btn_delete)
         btn_row.addStretch()
-        layout.addLayout(btn_row)
+        box_layout.addLayout(btn_row)
+
+        layout.addWidget(accounts_box)
 
         self.refresh_accounts_table()
 
@@ -527,156 +546,6 @@ class BudgetApp(QMainWindow):
         if hasattr(self, 'tab_transactions2') and hasattr(self.tab_transactions2, 'refresh_account_dropdown'):
             self.tab_transactions2.refresh_account_dropdown()
 
-    def _init_reports_tab(self):
-        layout = QVBoxLayout(self.tab_reports)
-        add_refresh_row(layout, self.refresh_monthly_report)
-
-        month_box = QGroupBox("Month")
-        mlayout = QFormLayout()
-
-        current_date = QDate.currentDate()
-        current_year = current_date.year()
-        current_month = current_date.month()
-
-        self.report_year = QComboBox()
-        for y in range(current_year - 5, current_year + 2):
-            self.report_year.addItem(str(y), y)
-        self.report_year.setCurrentText(str(current_year))
-
-        self.report_month = QComboBox()
-        for m in range(1, 13):
-            self.report_month.addItem(f"{m:02d}", m)
-        self.report_month.setCurrentText(f"{current_month:02d}")
-
-        mlayout.addRow("Year:", self.report_year)
-        mlayout.addRow("Month:", self.report_month)
-        month_box.setLayout(mlayout)
-        layout.addWidget(month_box)
-
-        btn_row = QHBoxLayout()
-        btn_export = QPushButton("Export Report (XLSX)")
-        btn_export.clicked.connect(self.export_monthly_report)
-
-        btn_row.addWidget(btn_export)
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
-
-        self.report_summary = QTextEdit()
-        self.report_summary.setReadOnly(True)
-        self.report_summary.setFont(QFont("Monospace", 10))
-        layout.addWidget(self.report_summary)
-
-        self.refresh_monthly_report()
-
-    def refresh_monthly_report(self):
-        year = self.report_year.currentData()
-        month = self.report_month.currentData()
-
-        # 1. Fetch Data
-        data = self.gl.monthly_income_expense_report(year, month)
-
-        # 2. Render and Display
-        html = html_renderers.render_monthly_report_html(year, month, data)
-        self.report_summary.setHtml(html)
-
-    def export_monthly_report(self):
-        year = self.report_year.currentData()
-        month = self.report_month.currentData()
-
-        path, _ = QFileDialog.getSaveFileName(self, "Export Monthly Report", "", "Excel Files (*.xlsx);;All Files (*)")
-        if not path:
-            return
-        if not path.endswith(".xlsx"):
-            path += ".xlsx"
-
-        try:
-            self.gl.export_monthly_income_expense_xlsx(year, month, path)
-            QMessageBox.information(self, "Export complete", f"Monthly report exported to:\n{path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Export failed", str(e))
-
-    def _init_reconcile(self):
-        layout = QVBoxLayout(self.tab_reconcile)
-        add_refresh_row(layout, self.load_unreconciled)
-
-        info = QLabel(
-            "Unreconciled transactions (usually from imported statements).\n"
-            "Select a row and mark it as reconciled once it matches your ledger."
-        )
-        layout.addWidget(info)
-
-        self.reconcile_tree = QTreeWidget()
-        self.reconcile_tree.setColumnCount(5)
-        self.reconcile_tree.setHeaderLabels(["ID", "Date", "Description / Account", "Imported ID / Amount", "Reconciled"])
-
-        header = self.reconcile_tree.header()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        header.setStretchLastSection(True)
-        header.setHighlightSections(False)
-
-        self.reconcile_tree.setRootIsDecorated(True)
-        self.reconcile_tree.setAlternatingRowColors(True)
-        layout.addWidget(self.reconcile_tree)
-
-        btn_row = QHBoxLayout()
-        btn_mark = QPushButton("Mark Selected as Reconciled")
-        btn_mark.clicked.connect(self.mark_selected_reconciled)
-        btn_row.addWidget(btn_mark)
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
-
-        self.load_unreconciled()
-
-    def load_unreconciled(self):
-        txs = self.gl.get_unreconciled_transactions()
-        self.reconcile_tree.clear()
-        for tx in txs:
-            # --- TOP LEVEL ITEM (Main Transaction) ---
-            item = QTreeWidgetItem(self.reconcile_tree)
-            item.setData(0, Qt.ItemDataRole.UserRole, tx.id) # Store DB ID
-            item.setText(0, str(tx.id))
-            item.setText(1, tx.date)
-            item.setText(2, tx.description)
-            item.setText(3, tx.imported_id or "")
-            item.setText(4, "Yes" if tx.reconciled else "No")
-
-            # Make it selectable
-            flags = item.flags() | Qt.ItemFlag.ItemIsSelectable
-            item.setFlags(flags)
-
-            # --- CHILD ITEMS (Split Lines) ---
-            for line in tx.lines:
-                sub_item = QTreeWidgetItem(item)
-                sub_item.setText(2, line.account_name)
-
-                dr_text = f"Dr: {line.dr:.2f}" if line.dr > 0 else ""
-                cr_text = f"Cr: {line.cr:.2f}" if line.cr > 0 else ""
-                sub_item.setText(3, f"{dr_text}  {cr_text}".strip())
-
-                # Style sub-rows to look like indented split-lines
-                sub_color = QColor("#f0f4f8")
-                for col in range(5):
-                    sub_item.setBackground(col, sub_color)
-
-                # Prevent sub-rows from being selected independently
-                sub_item.setFlags(sub_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-
-
-    def mark_selected_reconciled(self):
-        item = self.reconcile_tree.currentItem()
-        if not item:
-            QMessageBox.information(self, "No selection", "Please select a transaction row.")
-            return
-
-        # Ensure we are acting on the top-level item (in case user clicked a sub-row)
-        while item.parent() is not None:
-            item = item.parent()
-
-        tx_id = item.data(0, Qt.ItemDataRole.UserRole)
-        if tx_id is not None:
-            self.gl.mark_reconciled(tx_id, True)
-            self.load_unreconciled()
-
     def _init_balance_sheet(self):
         layout = QVBoxLayout(self.tab_balance)
         add_refresh_row(layout, self.refresh_balance_sheet)
@@ -699,353 +568,10 @@ class BudgetApp(QMainWindow):
     def update_status_bar(self, percent: int, message: str):
         self.statusBar().showMessage(message)
 
-    def _init_sync_tab(self):
-        layout = QVBoxLayout(self.tab_sync)
-
-        server_box = QGroupBox("Mobile Sync")
-        form = QFormLayout()
-
-        self.sync_state_label = QLabel("Stopped")
-        self.sync_state_label.setFont(QFont("Monospace", 10))
-        form.addRow("Server:", self.sync_state_label)
-
-        self.sync_address_label = QLabel("—")
-        form.addRow("Address:", self.sync_address_label)
-
-        self.sync_pairing_label = QLabel("—")
-        self.sync_pairing_label.setFont(QFont("Monospace", 14))
-        form.addRow("Pairing code:", self.sync_pairing_label)
-
-        self.sync_fingerprint_label = QLabel("—")
-        self.sync_fingerprint_label.setFont(QFont("Monospace", 9))
-        form.addRow("Desktop fingerprint:", self.sync_fingerprint_label)
-
-        server_box.setLayout(form)
-        layout.addWidget(server_box)
-
-        controls = QHBoxLayout()
-        self.sync_start_button = QPushButton("Start Mobile Sync")
-        self.sync_start_button.clicked.connect(self.start_mobile_sync)
-        controls.addWidget(self.sync_start_button)
-
-        self.sync_stop_button = QPushButton("Stop Sync Server")
-        self.sync_stop_button.clicked.connect(self.stop_mobile_sync)
-        self.sync_stop_button.setEnabled(False)
-        controls.addWidget(self.sync_stop_button)
-        controls.addStretch()
-        layout.addLayout(controls)
-
-        qr_box = QGroupBox("Scan this QR code with the Android companion")
-        qr_layout = QHBoxLayout(qr_box)
-        self.sync_qr_label = QLabel("Start Mobile Sync to generate a QR code.")
-        self.sync_qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.sync_qr_label.setMinimumSize(0, 0)
-        self.sync_qr_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        qr_layout.addWidget(self.sync_qr_label, 1)
-        layout.addWidget(qr_box, 3)
-
-        status_box = QGroupBox("Sync Status")
-        status_layout = QVBoxLayout(status_box)
-        self.sync_handshake_label = QLabel("Handshake: —")
-        self.sync_peer_label = QLabel("Phone identity: —")
-        self.sync_last_cursor_label = QLabel("Last sync cursor: —")
-        self.sync_accounts_label = QLabel("Unknown accounts: none")
-        self.sync_held_label = QLabel("Held transactions: 0")
-
-        for widget in (
-            self.sync_handshake_label,
-            self.sync_peer_label,
-            self.sync_last_cursor_label,
-            self.sync_accounts_label,
-            self.sync_held_label,
-        ):
-            status_layout.addWidget(widget)
-        layout.addWidget(status_box)
-
-        account_row = QHBoxLayout()
-        self.sync_create_account_button = QPushButton("Create Missing Account(s)")
-        self.sync_create_account_button.clicked.connect(self.create_sync_accounts)
-        self.sync_create_account_button.setEnabled(False)
-        account_row.addWidget(self.sync_create_account_button)
-
-        self.sync_reprocess_button = QPushButton("Reprocess Held Transactions")
-        self.sync_reprocess_button.clicked.connect(self.reprocess_sync_transactions)
-        self.sync_reprocess_button.setEnabled(False)
-        account_row.addWidget(self.sync_reprocess_button)
-        account_row.addStretch()
-        layout.addLayout(account_row)
-
-        self.sync_log = QTextEdit()
-        self.sync_log.setReadOnly(True)
-        self.sync_log.setFont(QFont("Monospace", 9))
-        self.sync_log.setPlaceholderText("Sync events will appear here.")
-        layout.addWidget(self.sync_log, 1)
-
-    def _append_sync_log(self, message: str):
-        self.sync_log.append(message)
-        self.statusBar().showMessage(message, 5000)
-
-    def _render_sync_qr(self, payload: dict):
-        qr = qrcode.QRCode(version=None, box_size=8, border=4)
-        qr.add_data(json.dumps(payload, separators=(",", ":"), sort_keys=True))
-        qr.make(fit=True)
-        image = qr.make_image(fill_color="black", back_color="white").convert("RGB")
-
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
-        qimage = QImage.fromData(buffer.getvalue(), "PNG")
-        pixmap = QPixmap.fromImage(qimage)
-        self.sync_qr_pixmap = pixmap
-        self._resize_sync_qr()
-
-    def _resize_sync_qr(self):
-        pixmap = getattr(self, "sync_qr_pixmap", None)
-        if pixmap is None or pixmap.isNull():
-            return
-
-        available = self.sync_qr_label.size()
-        margin = 12
-        width = max(1, available.width() - margin * 2)
-        height = max(1, available.height() - margin * 2)
-        size = min(width, height)
-
-        self.sync_qr_label.setPixmap(
-            pixmap.scaled(
-                size,
-                size,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.FastTransformation,
-            )
-        )
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if hasattr(self, "sync_qr_label"):
-            self._resize_sync_qr()
-
-    def start_mobile_sync(self):
-        if self.sync_server is not None:
-            return
-
-        try:
-            pairing_code = make_pairing_code()
-            server = CogniSyncServer(
-                self.gl,
-                pairing_code,
-                on_sync_completed=lambda: self._create_safety_backup("post_sync")
-            )
-            self.sync_server = server
-            thread = threading.Thread(
-                target=server.serve_forever,
-                name="CogniSyncServer",
-                daemon=True,
-            )
-            thread.start()
-        except Exception as e:
-            QMessageBox.critical(self, "Mobile Sync", f"Could not start the sync server:\n{e}")
-            return
-
-        self.sync_thread = thread
-        bootstrap = server.bootstrap_data
-
-        self.sync_state_label.setText("Running — waiting for Android")
-        self.sync_address_label.setText(f"http://{bootstrap['desktop_ip']}:{bootstrap['port']}")
-        self.sync_pairing_label.setText(pairing_code)
-        self.sync_fingerprint_label.setText(bootstrap.get("desktop_fingerprint", "—"))
-        self._render_sync_qr(bootstrap)
-
-        self.sync_start_button.setEnabled(False)
-        self.sync_stop_button.setEnabled(True)
-        self.sync_log.clear()
-        self._append_sync_log("Sync server started.")
-        self._append_sync_log("Scan the QR code with the Android companion and enter the pairing code.")
-
-        self.sync_status_timer = QTimer(self)
-        self.sync_status_timer.setInterval(1000)
-        self.sync_status_timer.timeout.connect(self.poll_mobile_sync_status)
-        self.sync_status_timer.start()
-        self.poll_mobile_sync_status()
-
-        self.sync_status_timer = QTimer(self)
-        self.sync_status_timer.setInterval(1000)
-        self.sync_status_timer.timeout.connect(self.poll_mobile_sync_status)
-        self.sync_status_timer.start()
-        self.poll_mobile_sync_status()
-
-        # --- NEW: 5-Minute Hard Timeout for Security ---
-        # If the user starts the server but never syncs, this forces it to close,
-        # freeing the port and unblocking the audit scheduler.
-        self.sync_timeout_timer = QTimer(self)
-        self.sync_timeout_timer.setSingleShot(True)
-        self.sync_timeout_timer.timeout.connect(self._force_stop_sync_timeout)
-        self.sync_timeout_timer.start(5 * 60 * 1000)  # 5 minutes
-
-    def _force_stop_sync_timeout(self):
-        """Auto-closes the sync server after 5 minutes of inactivity."""
-        if self.sync_server is not None:
-            self._append_sync_log("Sync server auto-closed: 5-minute inactivity timeout reached.")
-            self.stop_mobile_sync(from_server=True)
-
-    def _sync_request(self, path: str):
-        if self.sync_server is None:
-            return None
-        ctx = self.sync_server.sync_context
-        url = f"http://127.0.0.1:{self.sync_server.server_port}{path}"
-        body = json.dumps({"session_id": ctx.session_id}).encode("utf-8")
-        request = urllib.request.Request(
-            url,
-            data=body,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {ctx.http_token}",
-            },
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=0.5) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
-            print("STATUS DEBUG - request failed:", repr(e))
-            return None
-
-    def poll_mobile_sync_status(self):
-        if self.sync_server is None:
-            return
-
-        result = self._sync_request("/api/status")
-        if result is None:
-            if self.sync_thread is not None and not self.sync_thread.is_alive():
-                self.stop_mobile_sync(from_server=True)
-            return
-
-        handshake = bool(result.get("handshake_confirmed"))
-        reconnect = bool(result.get("reconnect_available"))
-        peer = result.get("peer_fingerprint") or "none"
-        unknown = result.get("unknown_accounts") or []
-        held = int(result.get("held_transaction_count", 0) or 0)
-        cursor = result.get("last_sync_cursor") or "—"
-
-        if handshake:
-            self.sync_state_label.setText("Connected — handshake confirmed")
-        elif reconnect:
-            self.sync_state_label.setText("Running — reconnect available")
-        else:
-            self.sync_state_label.setText("Running — waiting for Android")
-
-        self.sync_handshake_label.setText(f"Handshake: {'confirmed' if handshake else 'not confirmed'}")
-        self.sync_peer_label.setText(f"Phone identity: {peer}")
-        self.sync_last_cursor_label.setText(f"Last sync cursor: {cursor}")
-        self.sync_accounts_label.setText("Unknown accounts: " + (", ".join(unknown) if unknown else "none"))
-        self.sync_held_label.setText(f"Held transactions: {held}")
-        self.sync_create_account_button.setEnabled(bool(unknown))
-        self.sync_reprocess_button.setEnabled(held > 0)
-
-    def create_sync_accounts(self):
-        if self.sync_server is None:
-            return
-
-        ctx = self.sync_server.sync_context
-        with ctx._state_lock:
-            names = sorted(ctx.unknown_accounts)
-
-        for name in names:
-            dialog = QDialog(self)
-            dialog.setWindowTitle("Create Missing Account")
-            form = QFormLayout(dialog)
-            name_edit = QLineEdit(name)
-            type_combo = QComboBox()
-            for account_type in ("Asset", "Liability", "Equity", "Revenue", "Expense"):
-                type_combo.addItem(account_type)
-            form.addRow("Account:", name_edit)
-            form.addRow("Type:", type_combo)
-            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-            buttons.accepted.connect(dialog.accept)
-            buttons.rejected.connect(dialog.reject)
-            form.addRow(buttons)
-
-            if dialog.exec() != QDialog.DialogCode.Accepted:
-                continue
-
-            account_name = name_edit.text().strip()
-            if not account_name:
-                continue
-            ok, message = ctx.create_account(account_name, type_combo.currentText())
-            if ok:
-                self._append_sync_log(message)
-                self.tab_transactions.refresh_data()
-                self.tab_transactions2.refresh_data()
-                self.refresh_overview()
-            else:
-                QMessageBox.warning(self, "Create Account", message)
-
-        self.poll_mobile_sync_status()
-
-    def reprocess_sync_transactions(self):
-        if self.sync_server is None:
-            return
-        try:
-            result = self.sync_server.sync_context.reprocess_held()
-        except Exception as e:
-            QMessageBox.critical(self, "Reprocess Held Transactions", str(e))
-            return
-
-        posted = result.get("posted", [])
-        still_missing = result.get("still_missing", [])
-        self._append_sync_log(
-            f"Reprocessed {len(posted)} held transaction(s)."
-            + (f" Still missing: {', '.join(still_missing)}." if still_missing else "")
-        )
-        self.tab_transactions.refresh_data()
-        self.tab_transactions2.refresh_data()
-        self.refresh_overview()
-        self.poll_mobile_sync_status()
-
-    def stop_mobile_sync(self, from_server: bool = False):
-        server = self.sync_server
-        if server is None:
-            return
-
-        if hasattr(self, 'sync_timeout_timer') and self.sync_timeout_timer is not None:
-            self.sync_timeout_timer.stop()
-            self.sync_timeout_timer = None
-
-        if self.sync_status_timer is not None:
-            self.sync_status_timer.stop()
-            self.sync_status_timer.deleteLater()
-            self.sync_status_timer = None
-
-        try:
-            server.sync_context.request_shutdown()
-            server.shutdown()
-            server.server_close()
-        except Exception as e:
-            if not from_server:
-                self._append_sync_log(f"Error stopping sync server: {e}")
-
-        self.sync_server = None
-        self.sync_thread = None
-        self.sync_state_label.setText("Stopped")
-        self.sync_address_label.setText("—")
-        self.sync_pairing_label.setText("—")
-        self.sync_fingerprint_label.setText("—")
-        self.sync_qr_label.clear()
-        self.sync_qr_label.setText("Start Mobile Sync to generate a QR code.")
-        self.sync_handshake_label.setText("Handshake: —")
-        self.sync_peer_label.setText("Phone identity: —")
-        self.sync_last_cursor_label.setText("Last sync cursor: —")
-        self.sync_accounts_label.setText("Unknown accounts: none")
-        self.sync_held_label.setText("Held transactions: 0")
-        self.sync_start_button.setEnabled(True)
-        self.sync_stop_button.setEnabled(False)
-        self.sync_create_account_button.setEnabled(False)
-        self.sync_reprocess_button.setEnabled(False)
-        if not from_server:
-            self._append_sync_log("Sync server stopped.")
-
     def _run_silent_auto_backup(self, trigger: str = "close"):
         """Creates a timestamped encrypted backup in ~/BudgetData/backups/ and prunes backups older than 30 days."""
         try:
-            backup_dir = os.path.join(os.path.dirname(self.gl.db_path), "backups")
+            backup_dir = str(BACKUP_DIR)
             os.makedirs(backup_dir, exist_ok=True)
 
             timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -1123,7 +649,7 @@ class BudgetApp(QMainWindow):
                 "to load your restored data."
             )
             # Gracefully shut down background threads before quitting
-            self.stop_mobile_sync()
+            self.tab_sync.stop_sync()
             QApplication.instance().quit()
         else:
             QMessageBox.critical(self, "Restore Failed", msg)
@@ -1132,7 +658,7 @@ class BudgetApp(QMainWindow):
         if hasattr(self, 'test_manager'):
             self.test_manager.cleanup()
         self._run_silent_auto_backup("close")
-        self.stop_mobile_sync()
+        self.tab_sync.stop_sync()
         try:
             self.gl.close()
         except Exception:

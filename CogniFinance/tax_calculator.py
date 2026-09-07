@@ -1,6 +1,6 @@
 """
-tax_calculator.py ver 0.1
-For CogniFinanace ver 1.8
+tax_calculator.py ver 0.2
+For CogniFinanace ver 1.95
 Dynamic tax calculation using JSON templates from tax_templates/ folder.
 """
 import os
@@ -8,6 +8,7 @@ import json
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, List  # <--- FIXED: Added List to imports
 from pathlib import Path
+from config import TAX_TEMPLATES_DIR
 
 ZERO = Decimal("0.00")
 HUNDRED = Decimal("100.00")
@@ -34,13 +35,12 @@ def _load_tax_template(tax_year: str = "2025_2026_canada_ontario") -> dict:
     Loads tax rates from JSON template in tax_templates/ folder.
     Looks for: tax_templates/{tax_year}.json
     """
-    base_dir = Path(__file__).parent
-    template_path = base_dir / "tax_templates" / f"{tax_year}.json"
+    template_path = TAX_TEMPLATES_DIR / f"{tax_year}.json"
 
     if not template_path.exists():
         raise FileNotFoundError(
             f"Tax template not found: {template_path}\n"
-            f"Available templates should be placed in: {base_dir / 'tax_templates'}"
+            f"Available templates should be placed in: {TAX_TEMPLATES_DIR / 'tax_templates'}"
         )
 
     with open(template_path, "r", encoding="utf-8") as f:
@@ -145,14 +145,12 @@ def estimate_tax_liability(net_income: Decimal, tax_year: str = "2025_2026_canad
 
 def get_available_tax_templates() -> List[str]:
     """Returns a list of available tax template filenames."""
-    base_dir = Path(__file__).parent
-    template_dir = base_dir / "tax_templates"
 
-    if not template_dir.exists():
+    if not TAX_TEMPLATES_DIR.exists():
         return []
 
     valid_templates = []
-    for filepath in template_dir.glob("*.json"):
+    for filepath in TAX_TEMPLATES_DIR.glob("*.json"):
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 data = json.load(f)

@@ -1,5 +1,5 @@
-# protocol.py ver 0,2
-# For CogniFinance ver 1.8
+# protocol.py ver 0,3
+# For CogniFinance ver 1.95
 
 from __future__ import annotations
 import base64, hashlib, hmac, json, os, re, secrets, time, uuid
@@ -13,6 +13,13 @@ from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from spake2 import SPAKE2_A, SPAKE2_B
+from config import (
+    PAIRING_LOCKOUT_PATH as DEFAULT_PAIRING_LOCKOUT_PATH,
+    TRUST_STORE_PATH as DEFAULT_TRUST_STORE_PATH,
+    SYNC_IDENTITY_PATH as DEFAULT_IDENTITY_PATH,
+    create_secure_file, atomic_secure_write,
+)
+
 PROTOCOL='cogni-transfer'; VERSION=1
 def now_iso(): return datetime.now(timezone.utc).isoformat()
 def b64(x): return base64.urlsafe_b64encode(x).decode()
@@ -20,8 +27,6 @@ def unb64(x): return base64.urlsafe_b64decode(x.encode())
 def canonical_json(o): return json.dumps(o,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()
 def payload_hash(o): return hashlib.sha256(canonical_json(o)).hexdigest()
 def envelope(message_type,session_id,device_id,payload): return {'protocol':PROTOCOL,'version':VERSION,'message_type':message_type,'session_id':session_id,'message_id':str(uuid.uuid4()),'device_id':device_id,'timestamp':now_iso(),'payload':payload}
-
-APP_DATA_DIR = os.environ.get("COGNIFINANCE_DATA_DIR", os.path.expanduser("~/BudgetData"))
 
 #Protocol ver. 0.4 Debug
 
@@ -197,13 +202,7 @@ def load_or_create_identity(path: str) -> Identity:
         return Identity.from_private_bytes(raw)
     except FileNotFoundError:
         identity = Identity()
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        fd = os.open(path, flags, 0o600)
-        try:
-            os.write(fd, identity.private_bytes)
-        finally:
-            os.close(fd)
+        create_secure_file(path, identity.private_bytes)
         return identity
     except (OSError, ValueError) as e:
         raise PairingError(f"Unable to load desktop identity: {e}")
@@ -435,10 +434,6 @@ class PairingError(Exception):
     didn't match, someone tampered with the exchange, or the attempt
     limiter is currently locked out."""
 
-
-DEFAULT_PAIRING_LOCKOUT_PATH = os.path.join(APP_DATA_DIR, ".cognifinance_pairing_lockout.json")
-
-
 class PairingAttemptLimiter:
     """
     Persisted exponential-backoff rate limiter for failed pairing
@@ -464,10 +459,10 @@ class PairingAttemptLimiter:
 
     def _save(self, attempts: int, locked_until: float) -> None:
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(self.state_path)), exist_ok=True)
-            with open(self.state_path, "w", encoding="utf-8") as f:
-                json.dump({"attempts": attempts, "locked_until": locked_until}, f)
-            os.chmod(self.state_path, 0o600)
+            atomic_secure_write(
+                self.state_path,
+                json.dumps({"attempts": attempts, "locked_until": locked_until}).encode(),
+            )
         except OSError:
             pass  # best-effort; a failure to persist shouldn't crash pairing
 
@@ -575,11 +570,7 @@ class PairingHandshake:
                 self.limiter.record_failure()
             raise PairingError(f"Malformed or invalid pairing message: {e}")
 
-        _spake2_debug("shared secret", raw_key)
-
         self._session_key = derive_session_key(raw_key, self.session_id)
-
-        _spake2_debug("session key", self._session_key)
 
     def confirmation_tag(self) -> bytes:
         if self._session_key is None:
@@ -636,11 +627,6 @@ def identity_fingerprint(public_key_bytes: bytes) -> str:
     """
     return hashlib.sha256(public_key_bytes).hexdigest()[:16]
 
-
-DEFAULT_TRUST_STORE_PATH = os.path.join(APP_DATA_DIR, ".cognifinance_trusted_devices.json")
-DEFAULT_IDENTITY_PATH = os.path.join(APP_DATA_DIR, ".cognifinance_sync_identity.key")
-
-
 class TrustStore:
     """
     Persisted "known peer" identity pins, analogous to SSH's
@@ -662,10 +648,10 @@ class TrustStore:
 
     def _save(self, data: dict) -> None:
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
-            with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-            os.chmod(self.path, 0o600)
+            atomic_secure_write(
+                self.path,
+                json.dumps(data, indent=2).encode("utf-8"),
+            )
         except OSError:
             pass
 

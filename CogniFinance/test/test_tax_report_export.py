@@ -42,12 +42,13 @@ def _sheet_rows(ws):
             continue
         yield dict(zip(header, row))
 
+DUMMY_DEK_HEX = os.urandom(32).hex()
 
 class TaxReportExportTestCase(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="cognibudget_taxexport_")
         self.db_path = os.path.join(self.tmpdir, "tax_export.db")
-        self.gl = GeneralLedger(self.db_path, "TaxExportTestPassphrase123!")
+        self.gl = GeneralLedger(self.db_path, DUMMY_DEK_HEX)
 
         # Real accounts drawn from the actual tax category map, so this
         # test exercises the real DENTIST_TAX_CATEGORIES mapping rather

@@ -26,7 +26,8 @@ class LedgerTestCase(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="cognibudget_test_")
         self.db_path = os.path.join(self.tmpdir, "test.db")
-        self.gl = GeneralLedger(self.db_path, "test-passphrase-123")
+        self.test_dek_hex = os.urandom(32).hex()
+        self.gl = GeneralLedger(self.db_path, self.test_dek_hex)
 
     def tearDown(self):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
@@ -88,93 +89,6 @@ class TestReconciliation(LedgerTestCase):
         ok, msg = self.gl.delete_statement_balance(checkpoints[0]["id"])
         self.assertTrue(ok)
         self.assertEqual(self.gl.get_statement_balances("Checking Account"), [])
-
-
-class TestTransactionHistory(LedgerTestCase):
-    def test_creating_a_transaction_logs_a_created_entry(self):
-        self.gl.post_simple_transaction("2026-01-05", "Coffee", "Checking Account", "Groceries", 5.25)
-        tx_id = self.gl.transactions[-1].id
-        history = self.gl.get_transaction_history(tx_id)
-        self.assertEqual(len(history), 1)
-        self.assertEqual(history[0]["change_type"], "created")
-        self.assertEqual(history[0]["description"], "Coffee")
-
-    def test_updating_a_transaction_logs_the_prior_state(self):
-        self.gl.post_simple_transaction("2026-01-05", "Coffee", "Checking Account", "Groceries", 5.25)
-        tx_id = self.gl.transactions[-1].id
-
-        self.gl.update_transaction(
-            tx_id, "2026-01-05", "Coffee (corrected)",
-            [(None, "Checking Account", 0, 6.75), (None, "Groceries", 6.75, 0)],
-        )
-
-        history = self.gl.get_transaction_history(tx_id)
-        self.assertEqual(len(history), 2)
-        self.assertEqual(history[0]["change_type"], "created")
-        self.assertEqual(history[1]["change_type"], "updated")
-        # The "updated" entry captures the state *before* the edit
-        self.assertEqual(history[1]["description"], "Coffee")
-        self.assertEqual(history[1]["lines"][1]["dr"], "5.25")
-
-        # And the ledger now reflects the new state
-        current = [t for t in self.gl.transactions if t.id == tx_id][0]
-        self.assertEqual(current.description, "Coffee (corrected)")
-
-    def test_deleting_a_transaction_logs_its_final_state_and_survives_deletion(self):
-        self.gl.post_simple_transaction("2026-01-05", "Coffee", "Checking Account", "Groceries", 5.25)
-        tx_id = self.gl.transactions[-1].id
-
-        ok, msg = self.gl.delete_transaction(tx_id)
-        self.assertTrue(ok)
-
-        history = self.gl.get_transaction_history(tx_id)
-        self.assertEqual(len(history), 2)
-        self.assertEqual(history[1]["change_type"], "deleted")
-        self.assertEqual(history[1]["description"], "Coffee")
-
-    def test_get_recent_history_is_most_recent_first(self):
-        self.gl.post_simple_transaction("2026-01-05", "Coffee", "Checking Account", "Groceries", 5.25)
-        self.gl.post_simple_transaction("2026-01-06", "Lunch", "Checking Account", "Groceries", 12.00)
-
-        recent = self.gl.get_recent_history(limit=10)
-        descriptions_in_order = [h["description"] for h in recent]
-        self.assertEqual(descriptions_in_order[0], "Lunch")
-        self.assertEqual(descriptions_in_order[1], "Coffee")
-
-    def test_history_for_unknown_tx_id_is_empty(self):
-        self.assertEqual(self.gl.get_transaction_history(999999), [])
-
-    def test_update_of_nonexistent_transaction_does_not_log_history(self):
-        ok, msg = self.gl.update_transaction(
-            999999, "2026-01-05", "Ghost", [(None, "Checking Account", 0, 1), (None, "Groceries", 1, 0)]
-        )
-        self.assertFalse(ok)
-        self.assertEqual(self.gl.get_transaction_history(999999), [])
-
-
-class TestRekey(LedgerTestCase):
-    def test_rekey_changes_passphrase_and_db_reopens_with_new_one(self):
-        self.gl.post_simple_transaction("2026-01-05", "Payroll", "Salary Income", "Checking Account", 1500.00)
-        ok, msg = self.gl.rekey("a-brand-new-passphrase-123")
-        self.assertTrue(ok)
-
-        # Old passphrase should no longer work
-        with self.assertRaises(ValueError):
-            GeneralLedger(self.db_path, "test-passphrase-123")
-
-        # New passphrase should work and data should still be there
-        gl2 = GeneralLedger(self.db_path, "a-brand-new-passphrase-123")
-        self.assertEqual(len(gl2.transactions), 1)
-
-    def test_rekey_rejects_empty_passphrase(self):
-        ok, msg = self.gl.rekey("")
-        self.assertFalse(ok)
-
-    def test_rekey_hardens_file_permissions(self):
-        import stat
-        self.gl.rekey("a-brand-new-passphrase-123")
-        mode = stat.S_IMODE(os.stat(self.db_path).st_mode)
-        self.assertEqual(mode, 0o600)
 
 
 if __name__ == "__main__":

@@ -11,13 +11,15 @@ import shutil
 import logging
 from datetime import datetime
 from ledger import GeneralLedger
+from config import BACKUP_STATUS_PATH
+from config import atomic_secure_write_json
 
 logger = logging.getLogger(__name__)
 
 class BackupManager:
     def __init__(self, db_dir: str):
         self.db_dir = db_dir
-        self.status_path = os.path.join(self.db_dir, "backup_status.json")
+        self.status_path = str(BACKUP_STATUS_PATH)
 
     # ==========================================
     # Health Tracking & State Management
@@ -33,8 +35,7 @@ class BackupManager:
 
     def _save_status(self, status: dict):
         try:
-            with open(self.status_path, 'w', encoding='utf-8') as f:
-                json.dump(status, f, indent=2)
+            atomic_secure_write_json(self.status_path, status)
         except OSError as e:
             logger.warning(f"Could not save backup status: {e}")
 
@@ -104,7 +105,7 @@ class BackupManager:
         WARNING: If successful, the ledger connection is permanently closed.
         The caller MUST terminate the application immediately.
         """
-        live_db = ledger.db_path
+        live_db = str(ledger.db_path)
         snapshot_path = live_db + ".pre_restore_snapshot"
 
         # 1. Create safety snapshot

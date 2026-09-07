@@ -27,9 +27,9 @@ class AuditTab(QWidget):
     TYPE_MAP = {0: None, 1: "created", 2: "updated", 3: "deleted"}
     TYPE_COLORS = {"created": "#007a00", "updated": "#d68910", "deleted": "#b00000"}
 
-    def __init__(self, db_path: str, passphrase: str, parent: Optional[QWidget] = None):
+    def __init__(self, db_path: str, dek_hex: str, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.reader = AuditLogReader(db_path, passphrase)
+        self.reader = AuditLogReader(db_path, dek_hex)
         self._page = 0
         self._total = 0
         self._rows_cache: list = []  # current page's rows, for double-click detail

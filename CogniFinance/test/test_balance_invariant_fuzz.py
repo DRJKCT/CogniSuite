@@ -89,7 +89,8 @@ class TestBalanceInvariantFuzz(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="cognibudget_fuzz_")
         self.db_path = os.path.join(self.tmpdir, "fuzz.db")
-        self.gl = GeneralLedger(self.db_path, "FuzzTestPassphrase123!")
+        self.test_dek_hex = os.urandom(32).hex()
+        self.gl = GeneralLedger(self.db_path, self.test_dek_hex)
 
         # Broaden beyond the default chart of accounts so all five
         # account types (and several accounts per type) get exercised,
@@ -153,11 +154,11 @@ class TestBalanceInvariantFuzz(unittest.TestCase):
                 # update_transaction may legitimately fail if tx_id was
                 # already deleted by a prior fuzz step -- that's fine,
                 # just don't assert success unconditionally.
-                self.gl.update_transaction(tx_id, date, f"Fuzz edit {i}", [(dr_acc, amount, 0), (cr_acc, 0, amount)])
+                self.gl.edit_transaction(tx_id, date, f"Fuzz edit {i}", [(None, dr_acc, amount, 0), (None, cr_acc, 0, amount)])
 
             elif action == "delete" and posted_tx_ids:
                 tx_id = rng.choice(posted_tx_ids)
-                self.gl.delete_transaction(tx_id)
+                self.gl.void_transaction(tx_id)
                 # Leave it in posted_tx_ids -- deleting an already-deleted
                 # id should just fail gracefully, which is itself worth
                 # exercising here.

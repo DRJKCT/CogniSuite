@@ -200,11 +200,14 @@ class ImportManager(QObject):
         self.data_imported.emit()
 
     def _update_progress(self, percent: int, message: str):
-        if self.progress_dialog is not None:
+        dialog = self.progress_dialog
+        if dialog is not None:
             try:
-                self.progress_dialog.setValue(percent)
-                self.progress_dialog.setLabelText(message)
-            except RuntimeError:
+                dialog.setValue(percent)
+                dialog.setLabelText(message)
+            except (RuntimeError, AttributeError):
+                # RuntimeError catches "wrapped C++ object is deleted"
+                # AttributeError catches if it somehow becomes None
                 pass
 
     def _on_import_error(self, error_message: str):
@@ -306,16 +309,19 @@ class ImportManager(QObject):
             bank_desc = p_tx.get("description", "")
             tx = next((t for t in self.gl.transactions if t.id == pending_id), None)
             if tx:
+                old_imp_id = tx.imported_id
                 existing_lines = [(l.id, l.account_name, l.dr, l.cr) for l in tx.lines]
-                ok, msg = self.gl.update_transaction(pending_id, bank_date, bank_desc, existing_lines)
+                ok, msg = self.gl.edit_transaction(pending_id, bank_date, bank_desc, existing_lines)
                 if ok:
-                    self.gl.mark_reconciled(pending_id, True)
+                    new_tx = next((t for t in self.gl.transactions if t.imported_id == old_imp_id), None)
+                    if new_tx:
+                        self.gl.mark_reconciled(new_tx.id, True)
                     if match_type == "bank_to_bank":
                         duplicate_imp_id = p_tx.get("imported_id")
                         if duplicate_imp_id:
                             duplicate_tx = next((t for t in self.gl.transactions if t.imported_id == duplicate_imp_id), None)
                             if duplicate_tx:
-                                self.gl.delete_transaction(duplicate_tx.id)
+                                self.gl.void_transaction(duplicate_tx.id)
                 else:
                     logger.warning(f"Failed to merge match {pending_id}: {msg}")
 

@@ -208,7 +208,7 @@ class AddEditTab(QWidget):
         dlg = EditTransactionDialog(self.gl, tx, self)
         if dlg.exec() == dlg.DialogCode.Accepted:
             new_date, new_desc, new_lines = dlg.get_data()
-            ok, msg = self.gl.update_transaction(tx_id, new_date, new_desc, new_lines)
+            ok, msg = self.gl.edit_transaction(tx_id, new_date, new_desc, new_lines)
             if not ok:
                 QMessageBox.warning(self, "Transaction Not Updated", msg)
                 return
@@ -233,7 +233,7 @@ class AddEditTab(QWidget):
             QMessageBox.warning(self, "Error", "Could not find transaction ID for selected row.")
             return
 
-        ok, msg = self.gl.delete_transaction(tx_id)
+        ok, msg = self.gl.void_transaction(tx_id)
         if ok:
             QMessageBox.information(self, "Success", "Transaction deleted.")
             self.refresh_data()

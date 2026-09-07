@@ -1,8 +1,9 @@
-#Ledger v1.1 redesigned update_transaction, delete_transaction, added reassign_account for the new add/edit tab
-#For CogniFinance ver 1.8
+#Ledger v1.2
+#For CogniFinance ver 1.95
 
 import os
 import glob
+import hashlib
 import json
 import logging
 import re
@@ -13,6 +14,7 @@ from datetime import datetime
 from sqlcipher3 import dbapi2 as sqlite3
 from calendar import monthrange
 
+from config import BACKUP_DIR
 
 # Currency Constants and Helper
 ZERO = Decimal("0.00")
@@ -122,12 +124,12 @@ class Account:
 
 
 class GeneralLedger:
-    def __init__(self, db_path: str, passphrase: str):
-        if not passphrase:
-            raise ValueError("A passphrase is strictly required to unlock the ledger database.")
+    def __init__(self, db_path: str, dek_hex: str):
+        if not dek_hex:
+            raise ValueError("A DEK hex string is strictly required to unlock the ledger data")
 
         self.db_path = db_path
-        self.passphrase = passphrase
+        self.dek_hex = dek_hex
         self.accounts: Dict[str, Account] = {}
         self.transactions: List[Transaction] = []
         self.budgets: Dict[Tuple[str, str], Budget] = {}
@@ -146,8 +148,7 @@ class GeneralLedger:
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
         try:
-            escaped_passphrase = self.passphrase.replace("'", "''")
-            cur.execute(f"PRAGMA key = '{escaped_passphrase}'")
+            cur.execute(f"PRAGMA key = \"x'{self.dek_hex}'\"")
             cur.execute(f"PRAGMA cipher_compatibility = {SQLCIPHER_COMPATIBILITY}")
             cur.execute(f"PRAGMA kdf_iter = {SQLCIPHER_KDF_ITER}")
 
@@ -172,8 +173,17 @@ class GeneralLedger:
         try:
             # --- NEW: Enable WAL mode so readers (audit.py) don't block writers (ledger.py) ---
             cur.execute("PRAGMA journal_mode = WAL;")
-            cur.execute("CREATE TABLE IF NOT EXISTS sql_accounts (name TEXT PRIMARY KEY, account_type TEXT)")
-            cur.execute("CREATE TABLE IF NOT EXISTS sql_transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, description TEXT, imported_id TEXT, reconciled INTEGER DEFAULT 0)")
+
+            cur.execute("CREATE TABLE IF NOT EXISTS sql_accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, account_type TEXT)")
+
+            cur.execute("CREATE TABLE IF NOT EXISTS sql_transactions ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "date TEXT, description TEXT, imported_id TEXT, "
+                    "reconciled INTEGER DEFAULT 0, "
+                    "is_voided INTEGER DEFAULT 0, "
+                    "reversed_by_tx_id INTEGER, "
+                    "reverses_tx_id INTEGER)")
+
             cur.execute("CREATE TABLE IF NOT EXISTS sql_transaction_lines (id INTEGER PRIMARY KEY AUTOINCREMENT, tx_id INTEGER, account_name TEXT, dr TEXT, cr TEXT, FOREIGN KEY(tx_id) REFERENCES sql_transactions(id))")
             cur.execute("CREATE TABLE IF NOT EXISTS sql_category_rules (id INTEGER PRIMARY KEY AUTOINCREMENT, keyword TEXT, category TEXT, case_sensitive INTEGER DEFAULT 0, enabled INTEGER DEFAULT 1)")
             cur.execute("CREATE TABLE IF NOT EXISTS sql_budgets (id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT, month TEXT, amount TEXT, UNIQUE(category, month))")
@@ -194,8 +204,19 @@ class GeneralLedger:
                 "changed_at TEXT, "
                 "date TEXT, "
                 "description TEXT, "
-                "lines_json TEXT)"
+                "lines_json TEXT, "
+                "prev_hash TEXT, "   # NEW: Hash of the previous row
+                "row_hash TEXT)"     # NEW: Hash of this row
             )
+            cur.execute("PRAGMA table_info(sql_transactions)")
+            columns = [info[1] for info in cur.fetchall()]
+
+            if "is_voided" not in columns:
+                cur.execute("ALTER TABLE sql_transactions ADD COLUMN is_voided INTEGER DEFAULT 0")
+            if "reversed_by_tx_id" not in columns:
+                cur.execute("ALTER TABLE sql_transactions ADD COLUMN reversed_by_tx_id INTEGER")
+            if "reverses_tx_id" not in columns:
+                cur.execute("ALTER TABLE sql_transactions ADD COLUMN reverses_tx_id INTEGER")
             conn.commit()
         finally:
             conn.close()
@@ -230,7 +251,7 @@ class GeneralLedger:
             for name, acc_type in rows:
                 self.accounts[name] = Account(name, acc_type)
 
-            cur.execute("SELECT id, date, description, imported_id, reconciled FROM sql_transactions ORDER BY date")
+            cur.execute("SELECT id, date, description, imported_id, reconciled FROM sql_transactions WHERE is_voided = 0 ORDER BY date")
             for tx_id, date, desc, imp_id, rec in cur.fetchall():
                 cur.execute("SELECT id, account_name, dr, cr FROM sql_transaction_lines WHERE tx_id = ?", (tx_id,))
                 lines = [TransactionLine(acc_name, money(dr) if dr else ZERO, money(cr) if cr else ZERO, id=line_id) for line_id, acc_name, dr, cr in cur.fetchall()]
@@ -270,7 +291,7 @@ class GeneralLedger:
         conn, cur = self._connect()
         try:
             cur.execute(
-                "SELECT 1 FROM sql_transactions WHERE imported_id = ? LIMIT 1",
+                "SELECT 1 FROM sql_transactions WHERE imported_id = ? AND is_voided = 0 LIMIT 1",
                 (imported_id,)
             )
             return cur.fetchone() is not None
@@ -580,10 +601,23 @@ class GeneralLedger:
         *before* the change was applied, so history reads as a log of
         prior versions.
         """
+        cur.execute("SELECT row_hash FROM sql_transaction_history ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+        prev_hash = row[0] if row else "0" * 64  # Genesis block hash if empty
+
+        # 2. Prepare data
+        lines_json = self._lines_to_json(lines)
+        changed_at = datetime.now().isoformat(timespec="seconds")
+
+        # 3. Compute the cryptographic hash for this specific row
+        payload = f"{tx_id}{change_type}{changed_at}{date}{description}{lines_json}{prev_hash}"
+        row_hash = hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+        # 4. Insert with the hashes
         cur.execute(
-            "INSERT INTO sql_transaction_history (tx_id, change_type, changed_at, date, description, lines_json) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (tx_id, change_type, datetime.now().isoformat(timespec="seconds"), date, description, self._lines_to_json(lines)),
+            "INSERT INTO sql_transaction_history (tx_id, change_type, changed_at, date, description, lines_json, prev_hash, row_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (tx_id, change_type, changed_at, date, description, lines_json, prev_hash, row_hash),
         )
 
     def _fetch_transaction_snapshot(self, cur, tx_id: int):
@@ -1112,26 +1146,66 @@ class GeneralLedger:
             amount=amount
         )
 
-    def update_transaction(self, tx_id: int, new_date: str, new_description: str, new_lines: List[Tuple[Optional[int], str, Any, Any]]) -> Tuple[bool, str]:
+    def void_transaction(self, tx_id: int) -> Tuple[bool, str]:
         """
-        new_lines: list of (line_id, account_name, dr, cr).
-        line_id is the existing sql_transaction_lines.id to preserve --
-        pass None for a newly added line (it gets a fresh id on insert).
-
-        This preserves ids for lines that already existed (matched by id,
-        updated in place) rather than deleting and reinserting every line
-        on every edit -- the previous implementation reassigned a brand
-        new id to every single line on every edit, even ones the user
-        never touched, which made it impossible for the audit trail to
-        show which specific line in a split transaction actually changed.
-
-        Any existing line whose id is NOT present in new_lines is treated
-        as removed by this edit and deleted. Any incoming id that doesn't
-        belong to this transaction at all is rejected outright, rather
-        than silently ignored -- accepting it could let a caller (however
-        unintentionally) edit a line that actually belongs to a different
-        transaction.
+        APPEND-ONLY DELETE: Voids the original transaction by creating a
+        perfect reversal (flipping DR/CR) and marking the original as voided.
         """
+        conn, cur = self._connect()
+        try:
+            # 1. Fetch original state
+            cur.execute("SELECT date, description, reconciled FROM sql_transactions WHERE id = ? AND is_voided = 0", (tx_id,))
+            row = cur.fetchone()
+            if not row:
+                return False, "Transaction not found or already voided."
+            old_date, old_desc, reconciled = row
+
+            if reconciled:
+                return False, "Cannot void a reconciled transaction. Unreconcile it first."
+
+            cur.execute("SELECT id, account_name, dr, cr FROM sql_transaction_lines WHERE tx_id = ?", (tx_id,))
+            old_lines = [(lid, acc, money(dr) if dr else ZERO, money(cr) if cr else ZERO) for lid, acc, dr, cr in cur.fetchall()]
+
+            # 2. Create the reversal transaction (flip DR and CR)
+            reversal_lines = [(None, acc, cr, dr) for _, acc, dr, cr in old_lines]
+            reversal_desc = f"VOID: {old_desc}"
+
+            cur.execute(
+                "INSERT INTO sql_transactions (date, description, imported_id, reconciled, is_voided, reverses_tx_id) "
+                "VALUES (?, ?, NULL, 0, 0, ?)",
+                (old_date, reversal_desc, tx_id)
+            )
+            new_tx_id = cur.lastrowid
+
+            for _, acc, dr, cr in reversal_lines:
+                cur.execute(
+                    "INSERT INTO sql_transaction_lines (tx_id, account_name, dr, cr) VALUES (?, ?, ?, ?)",
+                    (new_tx_id, acc, str(dr), str(cr))
+                )
+
+            # 3. Mark original as voided
+            cur.execute("UPDATE sql_transactions SET is_voided = 1, reversed_by_tx_id = ? WHERE id = ?", (new_tx_id, tx_id))
+
+            # 4. Log to history (The chain remains unbroken)
+            self._log_history(cur, tx_id, "voided", old_date, old_desc, old_lines)
+            self._log_history(cur, new_tx_id, "created", old_date, reversal_desc, reversal_lines)
+
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+        finally:
+            conn.close()
+
+        self._load_from_db()
+        return True, "Transaction voided and reversed."
+
+    def edit_transaction(self, tx_id: int, new_date: str, new_description: str, new_lines: List[Tuple[Optional[int], str, Any, Any]]) -> Tuple[bool, str]:
+        """
+        APPEND-ONLY EDIT: Voids the original transaction and creates a brand new
+        one with the updated details. Preserves the immutable audit trail.
+        """
+        # 1. Validate new lines (same logic as before)
         if len(new_lines) < 2:
             return False, "A transaction must contain at least two lines."
 
@@ -1141,97 +1215,99 @@ class GeneralLedger:
                 dr_val, cr_val = money(dr), money(cr)
                 if not dr_val.is_finite() or not cr_val.is_finite():
                     raise ValueError(f"non-finite amount on account '{acc}'")
-                parsed.append((line_id, acc, dr_val, cr_val))
+                parsed.append((acc, dr_val, cr_val)) # We strip line_id for the new insert
         except (InvalidOperation, ValueError, TypeError) as e:
             return False, f"Invalid amount: {e}"
 
-        for line_id, acc, dr, cr in parsed:
-            if dr < ZERO or cr < ZERO:
-                return False, "Negative debits or credits are not allowed."
-            if dr > ZERO and cr > ZERO:
-                return False, "A transaction line cannot contain both a debit and a credit."
-            if dr == ZERO and cr == ZERO:
-                return False, "A transaction line must contain either a debit or a credit."
-            if acc not in self.accounts:
-                return False, f"Account '{acc}' does not exist."
+        for acc, dr, cr in parsed:
+            if dr < ZERO or cr < ZERO: return False, "Negative amounts not allowed."
+            if dr > ZERO and cr > ZERO: return False, "Line cannot have both DR and CR."
+            if dr == ZERO and cr == ZERO: return False, "Line must have DR or CR."
+            if acc not in self.accounts: return False, f"Account '{acc}' does not exist."
 
-        total_dr = sum((dr for _, _, dr, _ in parsed), ZERO)
-        total_cr = sum((cr for _, _, _, cr in parsed), ZERO)
+        total_dr = sum((dr for _, dr, _ in parsed), ZERO)
+        total_cr = sum((cr for _, _, cr in parsed), ZERO)
         if total_dr != total_cr:
             return False, "Transaction out of balance."
 
         conn, cur = self._connect()
         try:
-            snapshot = self._fetch_transaction_snapshot(cur, tx_id)
-            if snapshot is None:
-                return False, "Transaction not found."
-            old_date, old_description, old_lines = snapshot
+            # 2. Fetch original state
+            cur.execute("SELECT date, description, reconciled, imported_id  FROM sql_transactions WHERE id = ? AND is_voided = 0", (tx_id,))
+            row = cur.fetchone()
+            if not row:
+                return False, "Transaction not found or already voided."
+            old_date, old_desc, reconciled, old_imp_id = row
 
-            cur.execute("UPDATE sql_transactions SET date = ?, description = ? WHERE id = ?", (new_date, new_description, tx_id))
-            if cur.rowcount == 0:
-                return False, "Transaction not found."
+            if reconciled:
+                return False, "Cannot edit a reconciled transaction. Unreconcile it first."
 
-            cur.execute("SELECT id FROM sql_transaction_lines WHERE tx_id = ?", (tx_id,))
-            existing_ids = {row[0] for row in cur.fetchall()}
+            cur.execute("SELECT id, account_name, dr, cr FROM sql_transaction_lines WHERE tx_id = ?", (tx_id,))
+            old_lines = [(lid, acc, money(dr) if dr else ZERO, money(cr) if cr else ZERO) for lid, acc, dr, cr in cur.fetchall()]
 
-            incoming_ids = {line_id for line_id, _, _, _ in parsed if line_id is not None}
-            foreign_ids = incoming_ids - existing_ids
-            if foreign_ids:
-                conn.rollback()
-                return False, f"Line id(s) {sorted(foreign_ids)} do not belong to this transaction."
+            # 3. Mark original as voided
+            cur.execute("UPDATE sql_transactions SET is_voided = 1 WHERE id = ?", (tx_id,))
 
-            removed_ids = existing_ids - incoming_ids
-            if removed_ids:
-                placeholders = ",".join("?" for _ in removed_ids)
-                cur.execute(f"DELETE FROM sql_transaction_lines WHERE id IN ({placeholders})", list(removed_ids))
+            # 4. Insert new transaction
+            cur.execute(
+                "INSERT INTO sql_transactions (date, description, imported_id, reconciled, is_voided, reverses_tx_id) "
+                "VALUES (?, ?, ?, 0, 0, ?)",
+                (new_date, new_description, old_imp_id, tx_id)
+            )
+            new_tx_id = cur.lastrowid
 
-            for line_id, acc, dr, cr in parsed:
-                if line_id is not None:
-                    cur.execute(
-                        "UPDATE sql_transaction_lines SET account_name = ?, dr = ?, cr = ? WHERE id = ? AND tx_id = ?",
-                        (acc, str(dr), str(cr), line_id, tx_id),
-                    )
-                else:
-                    cur.execute(
-                        "INSERT INTO sql_transaction_lines (tx_id, account_name, dr, cr) VALUES (?, ?, ?, ?)",
-                        (tx_id, acc, str(dr), str(cr)),
-                    )
+            for acc, dr, cr in parsed:
+                cur.execute(
+                    "INSERT INTO sql_transaction_lines (tx_id, account_name, dr, cr) VALUES (?, ?, ?, ?)",
+                    (new_tx_id, acc, str(dr), str(cr))
+                )
 
-            # Log the state as it was *before* this update, so history
-            # reads as a trail of prior versions -- now including each
-            # line's id, so a split transaction's history documents
-            # exactly which line changed, not just that something did.
-            self._log_history(cur, tx_id, "updated", old_date, old_description, old_lines)
+            # 5. Log to history
+            self._log_history(cur, tx_id, "voided", old_date, old_desc, old_lines)
+            self._log_history(cur, new_tx_id, "created", new_date, new_description, [(None, acc, dr, cr) for acc, dr, cr in parsed])
+
             conn.commit()
         except Exception as e:
             conn.rollback()
             return False, str(e)
         finally:
             conn.close()
-        self._load_from_db()
-        return True, "Transaction updated."
 
-    def delete_transaction(self, tx_id: int) -> Tuple[bool, str]:
+        self._load_from_db()
+        return True, "Transaction edited (original voided, new created)."
+
+    def verify_audit_chain_integrity(self) -> Tuple[bool, str]:
+        """
+        Verifies the cryptographic hash chain of the audit trail.
+        Returns (is_valid, error_message).
+        """
         conn, cur = self._connect()
         try:
-            snapshot = self._fetch_transaction_snapshot(cur, tx_id)
-            if snapshot is None:
-                return False, "Transaction not found."
-            old_date, old_description, old_lines = snapshot
+            cur.execute(
+                "SELECT id, tx_id, change_type, changed_at, date, description, lines_json, prev_hash, row_hash "
+                "FROM sql_transaction_history ORDER BY id ASC"
+            )
+            rows = cur.fetchall()
 
-            cur.execute("DELETE FROM sql_transaction_lines WHERE tx_id = ?", (tx_id,))
-            cur.execute("DELETE FROM sql_transactions WHERE id = ?", (tx_id,))
-            if cur.rowcount == 0:
-                return False, "Transaction not found."
-            self._log_history(cur, tx_id, "deleted", old_date, old_description, old_lines)
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            return False, str(e)
+            expected_prev_hash = "0" * 64
+            for row in rows:
+                hid, tx_id, change_type, changed_at, date, description, lines_json, stored_prev_hash, stored_row_hash = row
+
+                if stored_prev_hash != expected_prev_hash:
+                    return False, f"Chain broken at history ID {hid}: expected prev_hash {expected_prev_hash[:16]}..., got {stored_prev_hash[:16]}..."
+
+                # Recompute the hash
+                payload = f"{tx_id}{change_type}{changed_at}{date}{description}{lines_json}{stored_prev_hash}"
+                computed_hash = hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+                if computed_hash != stored_row_hash:
+                    return False, f"Tampering detected at history ID {hid}: row hash mismatch."
+
+                expected_prev_hash = stored_row_hash
+
+            return True, f"Audit chain verified. {len(rows)} entries intact."
         finally:
             conn.close()
-        self._load_from_db()
-        return True, "Transaction deleted."
 
     def reassign_account(
         self,
@@ -1399,29 +1475,24 @@ class GeneralLedger:
             df_exp.to_excel(writer, sheet_name="Expenses_by_Account", index=False)
             df_tx.to_excel(writer, sheet_name="Transactions", index=False)
 
-    def rekey(self, new_passphrase: str) -> Tuple[bool, str]:
+    def close(self) -> None:
         """
-        Change the database's passphrase in place via SQLCipher's native
-        PRAGMA rekey (re-encrypts the file under a new key without a
-        full export/import). Used by the passphrase-recovery flow to let
-        someone set a fresh passphrase after recovering access, and
-        generally useful any time you want to change your passphrase.
+        Explicit "I'm done with this ledger" hook for callers (main.py's
+        first-run setup, ui_main.py's closeEvent).
+
+        GeneralLedger opens a short-lived connection per operation via
+        _connect() rather than holding one open for the object's
+        lifetime, so there's no persistent connection to release here.
+        What still matters on shutdown is durability: flush the WAL into
+        the main .db file so the data on disk is fully up to date (and,
+        as a safety net, roll back any sync batch left dangling by an
+        unclean previous exit) -- both of which checkpoint() already
+        does.
         """
-        if not new_passphrase:
-            return False, "A new passphrase is required."
-        conn, cur = self._connect()
         try:
-            escaped = new_passphrase.replace("'", "''")
-            cur.execute(f"PRAGMA rekey = '{escaped}'")
-            conn.commit()
-            self.passphrase = new_passphrase
-            self._harden_file_permissions(self.db_path)
-            return True, "Passphrase changed."
+            self.checkpoint()
         except Exception as e:
-            conn.rollback()
-            return False, str(e)
-        finally:
-            conn.close()
+            logger.warning(f"GeneralLedger.close(): checkpoint failed: {e}")
 
     def checkpoint(self) -> None:
         """
@@ -1456,7 +1527,7 @@ class GeneralLedger:
     def create_encrypted_backup(self, backup_path: Optional[str] = None) -> Tuple[bool, str]:
 
         if backup_path is None:
-            default_dir = os.environ.get("COGNIFINANCE_DATA_DIR", os.path.expanduser("~/BudgetData"))
+            default_dir = str(BACKUP_DIR)
             os.makedirs(default_dir, exist_ok=True)
             backup_path = os.path.join(default_dir, "ledger_storage_backup.db")
 
@@ -1472,8 +1543,7 @@ class GeneralLedger:
             if os.path.exists(backup_path):
                 os.remove(backup_path)
             escaped_path = backup_path.replace("'", "''")
-            escaped_pass = self.passphrase.replace("'", "''")
-            cur.execute(f"ATTACH DATABASE '{escaped_path}' AS backup KEY '{escaped_pass}'")
+            cur.execute(f"ATTACH DATABASE '{escaped_path}' AS backup KEY \"x'{self.dek_hex}'\"")
             cur.execute("SELECT sqlcipher_export('backup')")
             cur.execute("DETACH DATABASE backup")
             conn.commit()

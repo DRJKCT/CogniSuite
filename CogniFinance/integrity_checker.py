@@ -6,6 +6,8 @@ import sys
 import json
 import time
 from PyQt6.QtCore import QObject, QProcess, QProcessEnvironment, pyqtSignal
+from config import INTEGRITY_COOLDOWN_PATH
+from config import atomic_secure_write_json
 
 class IntegrityChecker(QObject):
     """
@@ -87,7 +89,7 @@ class IntegrityChecker(QObject):
 # Cooldown Management
 # =====================================================================
 def get_cooldown_path(db_dir: str) -> str:
-    return os.path.join(db_dir, ".integrity_check_cooldown.json")
+    return str(INTEGRITY_COOLDOWN_PATH)
 
 def should_run_integrity_check(db_dir: str, cooldown_days: int = 7) -> bool:
     path = get_cooldown_path(db_dir)
@@ -102,10 +104,10 @@ def should_run_integrity_check(db_dir: str, cooldown_days: int = 7) -> bool:
         return True
 
 def save_cooldown_timestamp(db_dir: str):
-    path = get_cooldown_path(db_dir)
     try:
-        os.makedirs(db_dir, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump({"last_run": time.time()}, f)
+        atomic_secure_write_json(
+            INTEGRITY_COOLDOWN_PATH,
+            {"last_run": time.time()},
+        )
     except Exception:
         pass

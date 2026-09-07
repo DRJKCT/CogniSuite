@@ -11,7 +11,8 @@ from audit import AuditLogReader
 def temp_ledger():
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_ledger.db")
-        gl = GeneralLedger(db_path, "TestPassphrase123!")
+        test_dek_hex = os.urandom(32).hex()
+        gl = GeneralLedger(db_path, test_dek_hex)
         yield gl
 
 # ==========================================
@@ -37,11 +38,13 @@ def test_audit_trail_on_edit(temp_ledger):
 
     # Edit the transaction to $15
     new_lines = [(None, "Checking Account", 0, 15), (None, "Groceries", 15, 0)]
-    temp_ledger.update_transaction(tx_id, "2026-01-01", "Updated", new_lines)
+    temp_ledger.edit_transaction(tx_id, "2026-01-01", "Updated", new_lines)
 
     history = temp_ledger.get_transaction_history(tx_id)
     assert len(history) == 2
-    assert history[1]["change_type"] == "updated"
+    # Append-only edit: the original tx is marked "voided" (not "updated") --
+    # its replacement is a brand new tx id with its own "created" entry.
+    assert history[1]["change_type"] == "voided"
 
     # The history payload MUST contain the old $10 lines
     old_lines = history[1]["lines"]
@@ -56,11 +59,13 @@ def test_audit_trail_on_delete(temp_ledger):
     )
     tx_id = temp_ledger.transactions[-1].id
 
-    temp_ledger.delete_transaction(tx_id)
+    temp_ledger.void_transaction(tx_id)
 
     history = temp_ledger.get_transaction_history(tx_id)
     assert len(history) == 2
-    assert history[1]["change_type"] == "deleted"
+    # Append-only delete: the original tx is marked "voided", and a separate
+    # reversal tx (its own id) carries the offsetting "created" entry.
+    assert history[1]["change_type"] == "voided"
 
 # ==========================================
 # 3. AUDIT LOG PAGINATION (FIXED)
@@ -72,7 +77,8 @@ def test_audit_log_pagination():
         passphrase = "PaginationTest123!"
 
         # Setup: Create a ledger and insert 25 transactions
-        gl = GeneralLedger(db_path, passphrase)
+        test_dek_hex = os.urandom(32).hex()
+        gl = GeneralLedger(db_path, test_dek_hex)
         for i in range(25):
             gl.record_transaction(
                 "2026-01-01", f"Tx {i}",
@@ -80,7 +86,7 @@ def test_audit_log_pagination():
             )
 
         # Test the AuditLogReader
-        reader = AuditLogReader(db_path, passphrase)
+        reader = AuditLogReader(db_path, test_dek_hex)
         page1 = reader.get_audit_log(limit=10, offset=0)
         page2 = reader.get_audit_log(limit=10, offset=10)
 

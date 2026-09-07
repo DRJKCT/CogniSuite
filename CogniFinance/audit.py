@@ -23,15 +23,14 @@ from ledger import SQLCIPHER_COMPATIBILITY, SQLCIPHER_KDF_ITER
 class AuditLogReader:
     """Read-only access to the ledger's transaction history table."""
 
-    def __init__(self, db_path: str, passphrase: str):
+    def __init__(self, db_path: str, dek_hex: str):
         self.db_path = db_path
-        self.passphrase = passphrase
+        self.dek_hex = dek_hex
 
     def _connect(self):
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
-        escaped = self.passphrase.replace("'", "''")
-        cur.execute(f"PRAGMA key = '{escaped}'")
+        cur.execute(f"PRAGMA key = \"x'{self.dek_hex}'\"")
         cur.execute(f"PRAGMA cipher_compatibility = {SQLCIPHER_COMPATIBILITY}")
         cur.execute(f"PRAGMA kdf_iter = {SQLCIPHER_KDF_ITER}")
         # --- NEW: Wait up to 5 seconds if ledger.py is writing ---

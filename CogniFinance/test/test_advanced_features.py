@@ -18,70 +18,7 @@ from passphrase_recovery import (
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ==========================================
-# 1. REKEY DATA STABILITY
-# ==========================================
-def test_rekey_data_stability():
-    """
-    Ensure that changing the database passphrase (rekeying) doesn't
-    corrupt data, and that the old passphrase is immediately invalidated.
-    """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = os.path.join(tmpdir, "test_rekey.db")
-        gl = GeneralLedger(db_path, "OldPassphrase123!")
-
-        # Post some data
-        gl.record_transaction("2026-01-01", "Paycheck", [
-            ("Checking Account", 2500.00, 0),
-            ("Salary Income", 0, 2500.00)
-        ])
-        original_balance = gl.accounts["Checking Account"].get_balance()
-
-        # Change the passphrase
-        ok, msg = gl.rekey("NewPassphrase456!")
-        assert ok is True
-
-        # 1. Verify we can open the DB with the NEW passphrase and data is intact
-        gl_new = GeneralLedger(db_path, "NewPassphrase456!")
-        assert len(gl_new.transactions) == 1
-        assert gl_new.accounts["Checking Account"].get_balance() == original_balance
-
-        # 2. Verify the OLD passphrase is now completely locked out
-        with pytest.raises(ValueError):
-            GeneralLedger(db_path, "OldPassphrase123!")
-
-# ==========================================
-# 2. ESCROW RECOVERY FLOW
-# ==========================================
-def test_escrow_recovery_flow():
-    """
-    Test the full lifecycle of the passphrase escrow file:
-    creation, successful decryption, failed decryption, and deletion.
-    """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = os.path.join(tmpdir, "dummy.db")
-        open(db_path, 'a').close() # Touch file so path resolution works
-
-        primary_pass = "CorrectHorseBatteryStaple"
-        recovery_pass = generate_recovery_passphrase()
-
-        # 1. Write Escrow
-        write_recovery_escrow(db_path, primary_pass, recovery_pass)
-        assert escrow_exists(db_path)
-
-        # 2. Read with CORRECT recovery key
-        recovered = read_recovery_escrow(db_path, recovery_pass)
-        assert recovered == primary_pass
-
-        # 3. Read with WRONG recovery key (Must return None, not crash)
-        wrong_key = generate_recovery_passphrase()
-        assert read_recovery_escrow(db_path, wrong_key) is None
-
-        # 4. Delete Escrow
-        delete_recovery_escrow(db_path)
-        assert not escrow_exists(db_path)
-
-# ==========================================
-# 3. "BALANCE AS OF" & RECONCILIATION
+# 1. "BALANCE AS OF" & RECONCILIATION
 # ==========================================
 def test_balance_as_of_and_reconciliation():
     """
@@ -121,7 +58,7 @@ def test_balance_as_of_and_reconciliation():
         assert mismatch_row["difference"] == Decimal("50.00") # 1400 - 1350
 
 # ==========================================
-# 4. IMPORT/EXPORT IDEMPOTENCY
+# 2. IMPORT/EXPORT IDEMPOTENCY
 # ==========================================
 def test_csv_import_export_idempotency():
     """

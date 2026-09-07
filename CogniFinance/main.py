@@ -8,6 +8,10 @@ import time
 import logging
 import traceback
 from typing import Optional
+from crypto_envelope import (
+    load_envelope, create_new_envelope, unlock_with_primary,
+    unlock_with_recovery, change_primary_passphrase, ENVELOPE_PATH
+)
 
 if "kde" in os.environ.get("XDG_CURRENT_DESKTOP", "").lower():
     os.environ.setdefault("QT_QPA_PLATFORMTHEME", "kde")
@@ -40,25 +44,25 @@ from passphrase_recovery import (
     write_recovery_escrow,
 )
 from passphrase_recovery_dialogs import RecoveryKeyDisplayDialog, RecoveryUnlockDialog
+from config import atomic_secure_write_json
+
+from config import (
+    ensure_directories, BUDGET_DIR, DB_PATH,
+    UNLOCK_LOCKOUT_PATH, SECURITY_DIR,
+)
 
 from qt_material import apply_stylesheet
-
-# main.py v0.1
 
 try:
     import keyring
 except Exception:
     keyring = None
 
-DB_DIR = os.environ.get(
-    "COGNIFINANCE_DATA_DIR",
-    os.path.expanduser("~/BudgetData"),
-)
-DB_PATH = os.path.join(DB_DIR, "ledger_storage.db")
+DB_DIR = str(BUDGET_DIR)
 
 SQLCIPHER_COMPATIBILITY = int(os.environ.get("LEDGER_SQLCIPHER_COMPATIBILITY", "4"))
 
-LOCKOUT_STATE_PATH = os.path.join(DB_DIR, ".unlock_lockout.json")
+LOCKOUT_STATE_PATH = str(UNLOCK_LOCKOUT_PATH)
 
 # Keyring service/key names. Namespaced by DB_DIR so switching between
 # data directories (via COGNIFINANCE_DATA_DIR) doesn't fetch a cached
@@ -86,10 +90,10 @@ def load_lockout_state() -> dict:
 
 def save_lockout_state(attempts: int, locked_until: float) -> None:
     try:
-        os.makedirs(os.path.dirname(LOCKOUT_STATE_PATH), exist_ok=True)
-        with open(LOCKOUT_STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump({"attempts": attempts, "locked_until": locked_until}, f)
-        os.chmod(LOCKOUT_STATE_PATH, 0o600)
+        atomic_secure_write_json(
+            LOCKOUT_STATE_PATH,
+            {"attempts": attempts, "locked_until": locked_until},
+        )
     except OSError:
         # Best-effort only -- a failure to persist shouldn't crash the app
         pass
@@ -100,37 +104,6 @@ def clear_lockout_state() -> None:
         os.remove(LOCKOUT_STATE_PATH)
     except OSError:
         pass
-
-
-def test_passphrase(db_path: str, passphrase: str) -> bool:
-    if not os.path.exists(db_path):
-        return True  # First run / new database
-    conn = None
-    try:
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-
-        escaped = passphrase.replace("'", "''")
-        cur.execute(f"PRAGMA key = '{escaped}'")
-        cur.execute(f"PRAGMA cipher_compatibility = {SQLCIPHER_COMPATIBILITY}")
-
-        # This triggers the actual page 1 read/decryption check
-        cur.execute("SELECT count(*) FROM sqlite_master")
-        cur.fetchone()
-
-        return True
-    except (sqlite3.DatabaseError, sqlite3.OperationalError, sqlite3.ProgrammingError):
-        # Explicitly catch all sqlite/sqlcipher-related exceptions
-        return False
-    except Exception:
-        # Catch any other unexpected system/OS errors
-        return False
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
 
 
 _STRENGTH_LEVELS = ["weak", "fair", "good", "strong"]
@@ -258,8 +231,9 @@ class SetPassphraseDialog(QDialog):
 
 
 class UnlockDialog(QDialog):
-    def __init__(self):
+    def __init__(self, legacy_mode=False):
         super().__init__()
+        self.used_recovery = False
         self.setWindowTitle("Unlock CogniFinance")
 
         state = load_lockout_state()
@@ -269,6 +243,7 @@ class UnlockDialog(QDialog):
         self.passphrase = ""
         self.save_to_keyring = False
         self.remaining_seconds = 0
+        self.used_recovery = False
 
         # Countdown timer for updating the UI every second
         self.countdown_timer = QTimer(self)
@@ -290,7 +265,8 @@ class UnlockDialog(QDialog):
         self.forgot_button = QPushButton("Forgot passphrase?")
         self.forgot_button.setFlat(True)
         self.forgot_button.clicked.connect(self._on_forgot_passphrase)
-        if not escrow_exists(DB_PATH):
+
+        if not ENVELOPE_PATH.exists():
             self.forgot_button.setEnabled(False)
             self.forgot_button.setToolTip("No recovery key was ever set up for this database.")
 
@@ -342,11 +318,24 @@ class UnlockDialog(QDialog):
             return
 
         self.status_label.setText("Checking passphrase...")
+        success = False
 
-        # This safely returns False on failure rather than crashing
-        if test_passphrase(DB_PATH, passphrase):
+        try:
+            unlock_with_primary(passphrase)
             self.passphrase = passphrase
             self.save_to_keyring = self.save_wallet_cb.isChecked()
+            self.used_recovery = False
+            success = True
+        except Exception:
+            try:
+                unlock_with_recovery(passphrase)
+                self.passphrase = passphrase
+                self.used_recovery = True
+                success = True
+            except Exception:
+                pass
+
+        if success:
             self.passphrase_edit.clear()
             clear_lockout_state()
             super().accept()
@@ -393,11 +382,20 @@ class UnlockDialog(QDialog):
             return
 
         recovered = recovery_dialog.recovered_passphrase
-        # Double-check the recovered passphrase actually still opens the
-        # database -- it normally will, but this guards against a stale
-        # escrow file (e.g. the passphrase was changed by some other
-        # means without regenerating the recovery key).
-        if not recovered or not test_passphrase(DB_PATH, recovered):
+
+        # Double-check the recovered passphrase actually still unlocks
+        # this database's envelope -- it normally will, but this guards
+        # against a stale escrow file (e.g. the passphrase was changed
+        # by some other means without regenerating the recovery key).
+        # NOTE: this must check the modern envelope (unlock_with_primary),
+        # not test_passphrase_legacy -- a DEK/KEK-envelope database is
+        # keyed with the raw DEK, never with a human passphrase directly,
+        # so the legacy check would fail here even on a fully successful
+        # recovery.
+
+        try:
+            unlock_with_recovery(recovered)
+        except Exception:
             QMessageBox.warning(
                 self, "Recovery Failed",
                 "Your recovery key was valid, but the recovered passphrase no longer "
@@ -415,22 +413,30 @@ class UnlockDialog(QDialog):
         save_to_keyring = False
 
         if choice == QMessageBox.StandardButton.Yes:
-            from ledger import GeneralLedger  # local import: avoid a hard dependency at module load time
-
             reset_dialog = SetPassphraseDialog(reset_mode=True)
             if reset_dialog.exec() == QDialog.DialogCode.Accepted:
                 try:
-                    gl = GeneralLedger(DB_PATH, recovered)
-                    ok, msg = gl.rekey(reset_dialog.passphrase)
-                    if not ok:
-                        QMessageBox.warning(self, "Could Not Change Passphrase", msg)
-                    else:
-                        final_passphrase = reset_dialog.passphrase
-                        save_to_keyring = reset_dialog.save_to_keyring
-                        new_recovery_key = generate_recovery_passphrase()
-                        write_recovery_escrow(DB_PATH, final_passphrase, new_recovery_key)
-                        key_dialog = RecoveryKeyDisplayDialog(new_recovery_key)
-                        key_dialog.exec()
+                    # change_primary_passphrase() already correctly
+                    # unwraps the DEK with the OLD primary and re-wraps
+                    # it with the NEW one -- no need to hand-roll that
+                    # here (the previous version of this code tried to
+                    # unwrap env["recovery"] using the recovered PRIMARY
+                    # passphrase, which can never work: that slot is
+                    # wrapped with a KEK derived from the RECOVERY
+                    # passphrase, a different secret entirely).
+                    change_primary_passphrase(recovered, reset_dialog.passphrase)
+
+                    # The primary passphrase just changed, so the escrow
+                    # file (which encrypts the primary under the recovery
+                    # key) must be rewritten too, or the next "Forgot
+                    # passphrase?" attempt would recover the now-stale
+                    # OLD primary instead of this new one.
+                    if recovery_key_used:
+                        write_recovery_escrow(DB_PATH, reset_dialog.passphrase, recovery_key_used)
+
+                    final_passphrase = reset_dialog.passphrase
+                    save_to_keyring = reset_dialog.save_to_keyring
+                    QMessageBox.information(self, "Success", "Passphrase changed successfully.")
                 except Exception as e:
                     QMessageBox.warning(self, "Could Not Change Passphrase", str(e))
 
@@ -439,30 +445,8 @@ class UnlockDialog(QDialog):
         clear_lockout_state()
         super().accept()
 
-
-def _setup_new_database(db_path: str) -> Optional[tuple]:
-    """
-    First-run flow: collect a new primary passphrase, generate a
-    recovery passphrase, show it once, and write the escrow file.
-    Returns (passphrase, save_to_keyring) or None if cancelled.
-    """
-    setup_dialog = SetPassphraseDialog(reset_mode=False)
-    if setup_dialog.exec() != QDialog.DialogCode.Accepted:
-        return None
-
-    passphrase = setup_dialog.passphrase
-    save_to_keyring = setup_dialog.save_to_keyring
-
-    recovery_key = generate_recovery_passphrase()
-    write_recovery_escrow(db_path, passphrase, recovery_key)
-
-    key_dialog = RecoveryKeyDisplayDialog(recovery_key)
-    key_dialog.exec()  # forces acknowledgment before continuing (see dialog's reject())
-
-    return passphrase, save_to_keyring
-
-
 def main():
+    ensure_directories()
     os.makedirs(DB_DIR, exist_ok=True)
     os.chmod(DB_DIR, 0o700)
 
@@ -477,59 +461,105 @@ def main():
         app.setWindowIcon(QIcon(icon_path))
 
     db_exists = os.path.exists(DB_PATH)
-    passphrase = None
+    envelope_exists = ENVELOPE_PATH.exists()
+
+    dek_hex = None
     save_to_keyring = False
+    # The plaintext PRIMARY passphrase, only ever populated when the user
+    # has opted in via a checkbox, and only ever used to write it to the
+    # OS keyring below -- never logged, never cached anywhere else, and
+    # cleared as soon as we're done with it.
+    passphrase_to_cache: Optional[str] = None
 
-    # 1. Attempt to fetch a cached passphrase silently from the OS keyring.
-    if keyring is not None:
-        try:
-            passphrase = keyring.get_password(KEYRING_SERVICE_NAME, KEYRING_KEY_NAME)
-        except Exception as e:
-            logging.warning(f"Keyring lookup failed: {e}")
-            passphrase = None
-
-    if db_exists and passphrase and test_passphrase(DB_PATH, passphrase):
-        # Cached passphrase is valid -- bypass the dialogs entirely.
-        clear_lockout_state()
-    else:
-        if not db_exists:
-            result = _setup_new_database(DB_PATH)
-        else:
-            dialog = UnlockDialog()
-            if dialog.exec() != QDialog.DialogCode.Accepted:
-                sys.exit(0)
-            result = (dialog.passphrase, dialog.save_to_keyring)
-            dialog.passphrase = ""
-            del dialog
-
-        if result is None:
+    # =========================================================================
+    # SCENARIO A: First Run (No DB, No Envelope)
+    # =========================================================================
+    if not db_exists and not envelope_exists:
+        setup_dialog = SetPassphraseDialog(reset_mode=False)
+        if setup_dialog.exec() != QDialog.DialogCode.Accepted:
             sys.exit(0)
 
-        passphrase, save_to_keyring = result
+        primary_pwd = setup_dialog.passphrase
+        save_to_keyring = setup_dialog.save_to_keyring
+        passphrase_to_cache = primary_pwd if save_to_keyring else None
 
-        if keyring is not None and save_to_keyring:
+        # Generate recovery key and show it to the user
+        recovery_key = generate_recovery_passphrase()
+        key_dialog = RecoveryKeyDisplayDialog(recovery_key)
+        key_dialog.exec()
+
+        # Create envelope and get DEK
+        dek_bytes, _ = create_new_envelope(primary_pwd, recovery_key)
+        dek_hex = dek_bytes.hex()
+
+        # Escrow the primary passphrase under the recovery key, so
+        # "Forgot passphrase?" has something to actually recover later.
+        write_recovery_escrow(DB_PATH, primary_pwd, recovery_key)
+
+        # Initialize the empty DB with the raw DEK
+        win_temp = BudgetApp(DB_PATH, dek_hex)
+        win_temp.gl.close() # Just let it create the schema and close
+
+    # =========================================================================
+    # SCENARIO B: Modern Setup (Envelope Exists)
+    # =========================================================================
+    elif envelope_exists:
+        # Try OS Keyring first
+        if keyring is not None:
             try:
-                keyring.set_password(KEYRING_SERVICE_NAME, KEYRING_KEY_NAME, passphrase)
+                cached_pwd = keyring.get_password(KEYRING_SERVICE_NAME, KEYRING_KEY_NAME)
+                if cached_pwd:
+                    dek_hex = unlock_with_primary(cached_pwd).hex()
+                else:
+                    logging.info("Keyring lookup returned no cached passphrase (service=%s, username=%s).", KEYRING_SERVICE_NAME, KEYRING_KEY_NAME)
             except Exception as e:
-                logging.warning(f"Failed to save to OS keyring: {e}")
+                logging.warning(f"Keyring lookup/unlock failed, falling back to manual unlock: {e!r}")
 
-    try:
-        win = BudgetApp(DB_PATH, passphrase)
-        passphrase = ""
-        if os.path.exists(DB_PATH):
-            os.chmod(DB_PATH, 0o600)
-    except Exception as e:
-        QMessageBox.critical(None, "Startup failed", f"Could not open the database:\n{e}")
-        logging.exception("Startup failed")
+        if not dek_hex:
+            # Prompt user for Primary Passphrase
+            dialog = UnlockDialog() # We will need to tweak UnlockDialog slightly, see below
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                sys.exit(0)
+
+            if dialog.used_recovery:
+                # Deliberately never cache the recovery passphrase itself --
+                # it's meant to stay a break-glass secret, not a day-to-day
+                # cached credential.
+                dek_hex = unlock_with_recovery(dialog.passphrase).hex()
+            else:
+                dek_hex = unlock_with_primary(dialog.passphrase).hex()
+                save_to_keyring = dialog.save_to_keyring
+                passphrase_to_cache = dialog.passphrase if save_to_keyring else None
+
+    # =========================================================================
+    # Launch App
+    # =========================================================================
+
+    if not dek_hex:
         sys.exit(1)
 
-    win.setWindowTitle("CogniFinance")
-    if os.path.exists(icon_path):
-        win.setWindowIcon(QIcon(icon_path))
+    try:
+        win = BudgetApp(DB_PATH, dek_hex)
+        dek_hex = "" # Clear from memory
+
+        if save_to_keyring and keyring is not None and passphrase_to_cache:
+            try:
+                keyring.set_password(KEYRING_SERVICE_NAME, KEYRING_KEY_NAME, passphrase_to_cache)
+            except Exception as e:
+                logging.warning(f"Failed to save passphrase to OS keyring: {e}")
+                QMessageBox.warning(
+                    win, "Keyring Save Failed",
+                    f"Your passphrase could not be saved to the OS keyring, "
+                    f"so you'll be asked for it again next time.\n\nDetails: {e}"
+                )
+        passphrase_to_cache = None # Clear from memory regardless of outcome
+
+    except Exception as e:
+        QMessageBox.critical(None, "Startup failed", f"Could not open the database:\n{e}")
+        sys.exit(1)
 
     win.show()
     sys.exit(app.exec())
-
 
 if __name__ == "__main__":
     main()

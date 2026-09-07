@@ -170,6 +170,11 @@ class RecoveryUnlockDialog(QDialog):
         super().__init__()
         self.db_path = db_path
         self.recovered_passphrase: Optional[str] = None
+        # The recovery passphrase the user actually typed in, kept around
+        # only so a caller that resets the primary passphrase afterward
+        # can re-escrow it under the same recovery key -- otherwise the
+        # escrow file would still contain the OLD primary passphrase.
+        self.recovery_passphrase_used: Optional[str] = None
         self.setWindowTitle("Recover Access - CogniBudget")
 
         info = QLabel("Enter your recovery key to regain access to your database.")
@@ -211,4 +216,5 @@ class RecoveryUnlockDialog(QDialog):
             return
 
         self.recovered_passphrase = primary
+        self.recovery_passphrase_used = recovery_passphrase
         self.accept()

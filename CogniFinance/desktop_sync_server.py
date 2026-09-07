@@ -1,7 +1,7 @@
 """
 CogniSync desktop HTTP server.
-Version 1.0
-For CogniFinance ver 1.8
+Version 1.1
+For CogniFinance ver 1.95
 
 Ephemeral LAN server that receives encrypted transaction batches from the
 Android companion app (MainActivity_dynamic_MN_timestamp_updated.kt) over the
@@ -92,7 +92,12 @@ from protocol import (
 )
 from ledger import GeneralLedger, money
 
-APP_DATA_DIR = os.environ.get("COGNIFINANCE_DATA_DIR", os.path.expanduser("~/BudgetData"))
+from config import (
+    SYNC_LOG_PATH, PAIRED_PHONE_PATH,
+    SYNC_IDENTITY_PATH as DEFAULT_IDENTITY_PATH,
+    TRUST_STORE_PATH as DEFAULT_TRUST_STORE_PATH,
+    atomic_secure_write,
+)
 
 # Optional dependency for LAN IP enumeration; the module still loads without it.
 try:
@@ -104,7 +109,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_LOG_PATH = os.path.join(APP_DATA_DIR, ".cognifinance_sync.log")
+DEFAULT_LOG_PATH = str(SYNC_LOG_PATH)
 
 
 def configure_file_logging(path: str = DEFAULT_LOG_PATH, level: int = logging.INFO) -> None:
@@ -153,7 +158,7 @@ def configure_file_logging(path: str = DEFAULT_LOG_PATH, level: int = logging.IN
 # --- Tunables ----------------------------------------------------------------
 MAX_REQUEST_SIZE = 10 * 1024 * 1024      # 10 MB request cap
 READ_TIMEOUT_SECONDS = 30                # per-request socket read timeout
-DEFAULT_PAIRED_PHONE_PATH = os.path.join(APP_DATA_DIR, ".cognifinance_paired_phone.json")
+DEFAULT_PAIRED_PHONE_PATH = str(PAIRED_PHONE_PATH)
 
 # --- Phone-safe response strings ---------------------------------------------
 # SECURITY: every string the phone may receive is defined here. Exception
@@ -256,7 +261,10 @@ def _save_paired_phone_fingerprint(fingerprint: str, path: str = DEFAULT_PAIRED_
         json.dump({"fingerprint": fingerprint}, f)
     os.replace(tmp, path)
     try:
-        os.chmod(path, 0o600)
+        atomic_secure_write(
+            path,
+            json.dumps({"fingerprint": fingerprint}).encode("utf-8"),
+        )
     except OSError:
         pass
 
@@ -418,11 +426,6 @@ def _handle_handshake(ctx: SyncContext, data: dict) -> tuple:
                 ctx.cached_pb = ctx.handshake.start()
             pb_bytes = ctx.cached_pb
 
-            print("HANDSHAKE DEBUG - raw_msg length:", len(raw_msg))
-            print("HANDSHAKE DEBUG - raw_msg prefix:", raw_msg[:1])
-            print("HANDSHAKE DEBUG - peer_msg length:", len(peer_msg))
-            print("HANDSHAKE DEBUG - peer_msg hex:", peer_msg.hex())
-
             # Process the phone's pA. derive() returns None and sets the session key.
             ctx.handshake.derive(peer_msg)
 
@@ -430,12 +433,6 @@ def _handle_handshake(ctx: SyncContext, data: dict) -> tuple:
             # the key itself. The raw SPAKE2 shared secret is derived inside
             # protocol.py; this fingerprint lets us compare the final KDF output
             # against Android before touching the confirmation calculation.
-            debug_session_key = getattr(ctx.handshake, "_session_key", None)
-            if isinstance(debug_session_key, bytes):
-                print(
-                    "SPAKE2 DEBUG - session key SHA256:",
-                    hashlib.sha256(debug_session_key).hexdigest()
-                )
 
             ctx.handshake_started = True
 

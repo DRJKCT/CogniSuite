@@ -1,6 +1,6 @@
 """
-passphrase_recovery.py ver 0.1
-For CogniFinance ver 1.8
+passphrase_recovery.py ver 0.2
+For CogniFinance ver 1.95
 Passphrase strength checking and the recovery-passphrase safety net.
 
 How recovery works: SQLCipher only ever has one valid passphrase for a
@@ -23,9 +23,13 @@ saved next to the database it's meant to be a fallback for.
 import os
 import json
 import secrets
+import hashlib
+from pathlib import Path
 from typing import Optional, Tuple
 
 from crypto_utils import encrypt_string_with_passphrase, decrypt_string_with_passphrase
+from config import RECOVERY_ESCROW_PATH
+from config import atomic_secure_write_json
 
 ESCROW_FILENAME = ".recovery_escrow.json"
 
@@ -96,7 +100,16 @@ def generate_recovery_passphrase(groups: int = 5, group_length: int = 4) -> str:
 
 
 def escrow_path_for(db_path: str) -> str:
-    return os.path.join(os.path.dirname(os.path.abspath(db_path)), ESCROW_FILENAME)
+    """
+    Namespaced by the target database's own absolute path -- the same
+    principle as main.py's KEYRING_KEY_NAME being namespaced by DB_DIR --
+    so pointing the app at a different database directory can't
+    accidentally read (or silently overwrite) an escrow file that
+    actually belongs to a completely different database.
+    """
+    base = Path(RECOVERY_ESCROW_PATH)
+    db_key = hashlib.sha256(os.path.abspath(db_path).encode("utf-8")).hexdigest()[:16]
+    return str(base.with_name(f"{base.stem}_{db_key}{base.suffix}"))
 
 
 def escrow_exists(db_path: str) -> bool:
@@ -107,9 +120,7 @@ def write_recovery_escrow(db_path: str, primary_passphrase: str, recovery_passph
     """Encrypt the primary passphrase under the recovery passphrase and write it to disk, 0600-permissioned."""
     path = escrow_path_for(db_path)
     blob = encrypt_string_with_passphrase(primary_passphrase, recovery_passphrase)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(blob, f)
-    os.chmod(path, 0o600)
+    atomic_secure_write_json(path, blob)
     return path
 
 
