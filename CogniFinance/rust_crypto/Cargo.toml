@@ -1,1 +1,19 @@
+[package]
+name = "cogni_vault"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "cogni_vault"
+crate-type = ["cdylib"] # Required for PyO3 to build a Python extension
+
+[dependencies]
+pyo3 = { version = "0.26", features = ["extension-module"] }
+argon2 = "0.5"          # Industry standard memory-hard KDF
+aes-gcm = "0.10"        # AES-256-GCM for envelope wrapping
+zeroize = "1.7"         # Guarantees memory wiping on Drop
+rand = "0.8"            # Cryptographically secure RNG
+libc = "0.2"            # For mlock/munlock
+base64 = "0.22"
+hex = "0.4"
 
