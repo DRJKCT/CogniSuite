@@ -1,0 +1,134 @@
+{
+  "cognifinance_tax_template": 1,
+  "template_type": "federal_base",
+  "template_id": "canada_federal",
+  "display_name": "Federal (2026)",
+  "description": "Federal income tax brackets, Basic Personal Amount, and CPP / CPP2 / EI levies for the 2026 tax year.",
+  "tax_year": 2026,
+  "federal_brackets": [
+    {
+      "threshold": 0,
+      "rate": 0.14
+    },
+    {
+      "threshold": 58523,
+      "rate": 0.205
+    },
+    {
+      "threshold": 117045,
+      "rate": 0.26
+    },
+    {
+      "threshold": 181440,
+      "rate": 0.29
+    },
+    {
+      "threshold": 258482,
+      "rate": 0.33
+    }
+  ],
+  "module_compatibility": {
+    "canada_employment": [
+      {
+        "version": 2026,
+        "valid_until": null
+      }
+    ],
+    "canada_self_employment": [
+      {
+        "version": 2026,
+        "valid_until": null
+      }
+    ],
+    "canada_dividends": [
+      {
+        "version": 2026,
+        "valid_until": null
+      }
+    ],
+    "canada_capital_gains": [
+      {
+        "version": 2026,
+        "valid_until": null
+      }
+    ],
+    "canada_rental": [
+      {
+        "version": 2026,
+        "valid_until": null
+      }
+    ],
+    "canada_retirement": [
+      {
+        "version": 2026,
+        "valid_until": null
+      }
+    ],
+    "canada_interest": [
+      {
+        "version": 2026,
+        "valid_until": null
+      }
+    ]
+  },
+  "levies": [
+    {
+      "name": "CPP (Employee)",
+      "type": "rate",
+      "rate": 0.059500000000000004,
+      "cap": 74600,
+      "exempt_amount": 3500,
+      "applies_to": [
+        "employment"
+      ]
+    },
+    {
+      "name": "CPP (Self-Employed)",
+      "type": "rate",
+      "rate": 0.11900000000000001,
+      "cap": 74600,
+      "exempt_amount": 3500,
+      "applies_to": [
+        "self_employment"
+      ]
+    },
+    {
+      "name": "CPP2 (Employee)",
+      "type": "rate",
+      "rate": 0.04,
+      "cap": 85000,
+      "exempt_amount": 74600,
+      "applies_to": [
+        "employment"
+      ]
+    },
+    {
+      "name": "CPP2 (Self-Employed)",
+      "type": "rate",
+      "rate": 0.08,
+      "cap": 85000,
+      "exempt_amount": 74600,
+      "applies_to": [
+        "self_employment"
+      ]
+    },
+    {
+      "name": "EI (Employee)",
+      "type": "rate",
+      "rate": 0.0163,
+      "cap": 68900,
+      "exempt_amount": 0,
+      "applies_to": [
+        "employment"
+      ]
+    }
+  ],
+  "credits": [
+    {
+      "name": "Federal Basic Personal Amount",
+      "type": "rate",
+      "amount": 16129.0,
+      "rate": 0.14
+    }
+  ]
+}

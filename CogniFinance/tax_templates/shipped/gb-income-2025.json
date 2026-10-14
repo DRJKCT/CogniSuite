@@ -1,0 +1,18 @@
+{
+  "cognifinance_tax_template": 4,
+  "template_type": "income_module",
+  "template_id": "gb-income-2025",
+  "display_name": {
+    "en": "UK income buckets"
+  },
+  "valid_from": 2025,
+  "buckets": {
+    "employment": {
+      "primitive": "inclusion_rate",
+      "rate": 1.0,
+      "label": {
+        "en": "Employment income"
+      }
+    }
+  }
+}

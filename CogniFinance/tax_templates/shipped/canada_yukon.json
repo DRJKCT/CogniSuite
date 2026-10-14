@@ -1,0 +1,40 @@
+{
+  "cognifinance_tax_template": 1,
+  "template_type": "provincial_base",
+  "template_id": "canada_yukon",
+  "display_name": "Yukon (2026)",
+  "description": "Yukon provincial income tax brackets and Basic Personal Amount for the 2026 tax year.",
+  "tax_year": 2026,
+  "provincial_brackets": [
+    {
+      "threshold": 0,
+      "rate": 0.064
+    },
+    {
+      "threshold": 58523,
+      "rate": 0.09
+    },
+    {
+      "threshold": 117045,
+      "rate": 0.109
+    },
+    {
+      "threshold": 181440,
+      "rate": 0.128
+    },
+    {
+      "threshold": 500000,
+      "rate": 0.15
+    }
+  ],
+  "module_compatibility": {},
+  "levies": [],
+  "credits": [
+    {
+      "name": "Yukon Basic Personal Amount",
+      "type": "rate",
+      "amount": 16129.0,
+      "rate": 0.064
+    }
+  ]
+}

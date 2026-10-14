@@ -1,0 +1,36 @@
+{
+  "cognifinance_tax_template": 1,
+  "template_type": "provincial_base",
+  "template_id": "canada_northwest_territories",
+  "display_name": "Northwest Territories (2026)",
+  "description": "Northwest Territories provincial income tax brackets and Basic Personal Amount for the 2026 tax year.",
+  "tax_year": 2026,
+  "provincial_brackets": [
+    {
+      "threshold": 0,
+      "rate": 0.059
+    },
+    {
+      "threshold": 53003,
+      "rate": 0.086
+    },
+    {
+      "threshold": 106009,
+      "rate": 0.122
+    },
+    {
+      "threshold": 172346,
+      "rate": 0.1405
+    }
+  ],
+  "module_compatibility": {},
+  "levies": [],
+  "credits": [
+    {
+      "name": "Northwest Territories Basic Personal Amount",
+      "type": "rate",
+      "amount": 17842.0,
+      "rate": 0.059
+    }
+  ]
+}

@@ -1,0 +1,49 @@
+{
+  "template_id": "dentist_associate_contractor",
+  "title": "Associate Dentist (Independent Contractor)",
+  "categories": {
+    "Professional Dues & Licensing": [
+      "RCDSO Dues",
+      "CDA Membership",
+      "Ontario Dental Association",
+      "Other Professional Dues"
+    ],
+    "Professional Liability Insurance": [
+      "Malpractice Insurance",
+      "Liability Insurance"
+    ],
+    "Continuing Education": [
+      "CE Courses",
+      "Conferences & Seminars",
+      "CE Travel & Accommodation",
+      "Books & Materials (CE)"
+    ],
+    "Professional Tools & Gear": [
+      "Loupes & Personal Instruments",
+      "Clinical Software & Subscriptions",
+      "Work Laptop & Hardware"
+    ],
+    "Accounting & Professional Fees": [
+      "Accounting & Tax Preparation",
+      "Legal Fees",
+      "Consulting Fees"
+    ],
+    "Vehicle & Travel": [
+      "Vehicle Fuel",
+      "Vehicle Maintenance",
+      "Vehicle Parking & Tolls",
+      "Vehicle Insurance (Business Portion)"
+    ],
+    "Office & Operating Costs": [
+      "Cell Phone (Business Portion)",
+      "Home Office Expenses",
+      "Bank Charges & Fees"
+    ]
+  },
+  "medical_accounts": [
+    "Medical Expenses",
+    "Dental Expenses",
+    "Prescriptions",
+    "Private Health Services Plan Premiums"
+  ]
+}

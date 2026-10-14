@@ -1,0 +1,40 @@
+{
+  "cognifinance_tax_template": 1,
+  "template_type": "provincial_base",
+  "template_id": "canada_nova_scotia",
+  "display_name": "Nova Scotia (2026)",
+  "description": "Nova Scotia provincial income tax brackets and Basic Personal Amount for the 2026 tax year.",
+  "tax_year": 2026,
+  "provincial_brackets": [
+    {
+      "threshold": 0,
+      "rate": 0.0879
+    },
+    {
+      "threshold": 30995,
+      "rate": 0.1495
+    },
+    {
+      "threshold": 61991,
+      "rate": 0.1667
+    },
+    {
+      "threshold": 97417,
+      "rate": 0.175
+    },
+    {
+      "threshold": 157124,
+      "rate": 0.21
+    }
+  ],
+  "module_compatibility": {},
+  "levies": [],
+  "credits": [
+    {
+      "name": "Nova Scotia Basic Personal Amount",
+      "type": "rate",
+      "amount": 11744.0,
+      "rate": 0.0879
+    }
+  ]
+}

@@ -1,0 +1,166 @@
+What CogniFinance is
+A local-first, encrypted, double-entry personal/small-business accounting desktop application. PyQt6 UI, SQLCipher-encrypted SQLite database, with an Android companion app that syncs via an ephemeral LAN HTTP server using a custom cryptographic protocol. No cloud, no network dependency for core operation.
+
+Target users and release plan: CogniFinance ships in four phases, each expanding the audience from personal users toward professional accounting firms. The architecture is designed so every phase builds on the prior phase's foundation — nothing is built and then discarded. Simple Mode / Pro Mode splits the UI for each phase: Simple Mode hides advanced features behind defaults and collapsed controls, Pro Mode exposes them. Both modes share the same engines and storage. Pro Mode is being built first; Simple Mode is a deliberate pruning of the UI, never a separate code path.
+
+Phase 1 — Individual privacy / security-conscious user. The foundational audience. People who want complete control over their financial data: no cloud, no telemetry, no account signup, no third-party analytics. Everything runs locally on their machine and their devices. The headline features are the encryption architecture (DEK/KEK envelope, Argon2id, mlock/zeroize in the Rust core), the append-only immutable ledger with hash-chained audit trail, and the mobile companion for posting transactions from a phone over a LAN. Simple Mode is the primary interface for this audience; Pro Mode is available but not the default. Core functionality: personal budgeting, expense tracking, CSV/OFX/PDF statement import, envelope budgeting, backup and recovery.
+
+Phase 2 — Crypto users. Add support for digital-asset holdings alongside traditional accounts. What this concretely means depends on scoping, but the phase likely implies: report lines for digital assets (as investments or a distinct asset class), multi-currency support with exchange-rate tracking, import from exchange CSV exports, and cost-basis / capital-gains tracking for tax purposes. Crypto users are a natural fit for Phase 1's privacy posture because they tend to be skeptical of centralized finance tools. This phase does not imply any network integration with exchanges or blockchains unless that later proves necessary — the local-first design is preserved. (Note: the specifics of Phase 2 are not yet scoped; the phase exists in the roadmap but the feature set is TBD.)
+
+Phase 3 — Small and medium businesses. Introduce the accounting features that SMBs and their owners need: full financial statements (balance sheet with report-line grouping, P&L with Gross Profit / Operating Income subtotals, statement of equity, trial balance), a report-line classification system for accounts (REPORT_LINE_METADATA in ledger.py), the envelope/ZBB budget engine with income plans and rollover policies, business income and expense categorization for tax reporting, and export to XLSX for accountant review. The CoA work already in progress — account_type, report_line, subcategory as the three-tier model — is squarely Phase 3 material. Simple Mode still exposes a scoped-down version (flat balance sheet, no report-line picker) so that SMB owners who aren't accountants aren't overwhelmed.
+
+Phase 4 — Accounting professionals. The largest expansion: tools for bookkeepers and accountants who manage multiple clients. This phase implies multi-database support with a client selector (the app already supports pointing at different DB paths via COGNIFINANCE_BASE_DIR — Phase 4 exposes it as a first-class UI), year-end close workflows (zero Revenue and Expense accounts into Retained Earnings at fiscal year end), adjusting journal entries distinct from regular transactions, review and reconciliation working papers, and audit-friendly exports. The hash-chained audit trail built in Phase 1 becomes the professional-grade proof-of-integrity that Phase 4 users require. Simple Mode is not offered in Phase 4 — the phase is inherently Pro Mode.
+
+Development stage: pre-alpha. Greenfield — no users yet, no migration concerns. Family beta testers are being onboarded soon. The user is a solo developer working across two machines (a dev machine and sometimes a tablet with a detachable keyboard, from which they can edit text but cannot run code or tests).
+
+New section: what the plan implies for the architecture
+The four-phase plan is coherent with the design decisions already made, and a few architectural choices make more sense in this light:
+
+Append-only ledger with hash chain. Built for Phase 1 (privacy/integrity) but is a prerequisite for Phase 4 (professional audit). The same mechanism serves both audiences at different intensities.
+
+Envelope budgeting engine. Built for Phase 1 (personal budgets) and reused in Phase 3 (business expense tracking). The rollover policies, income plans, and assignment ledger are all feature-agnostic — they don't know or care whether the user is a person or a business.
+
+Report-line classification. Built for Phase 3 but useful in Phase 2 for crypto-holdings classification. It's a general CoA-presentation feature; the specific report lines matter to Phase 3 but the mechanism is phase-agnostic.
+
+DEK/KEK envelope and recovery passphrase. Phase 1 features that stay in place through all phases. Phase 4 users get the same crypto under the hood, just with more workflows on top.
+
+Multi-database via env var. Currently used for test isolation. Phase 4's client-switching UI is a natural extension of the same plumbing.
+
+The report-builder architecture (ReportSection / ReportLine). Planned as shared infrastructure for balance sheet, P&L, equity statement, and trial balance. Phase 3 needs all four; Phase 4 needs the same four with additional workflows (adjusting entries, review markings). Building the shared structure once avoids building it four times.
+
+Simple Mode. Each phase defines what Simple Mode looks like for that phase's audience. Phase 1's Simple Mode is the primary interface; Phase 3's Simple Mode is a scoped-down version of an SMB interface; Phase 4 has no Simple Mode. The mode itself is a UI-layer feature — the underlying engines and storage never change.
+
+Current state relative to the plan
+Phase 1: substantially built. Encryption, ledger, mobile sync, envelope budgeting, imports, backups, audit chain — all present. Simple Mode not yet built (planned). Recovery passphrase and escrow flow present but not fully exercised in practice.
+
+Phase 2: not started. No crypto-specific features. Design discussions haven't happened; the phase is in the roadmap but not scoped.
+
+Phase 3: in progress. Report-line classification done at ledger and balance-sheet level. P&L subtotaling pending. Equity statement and trial balance renderers pending. The ReportSection / ReportLine shared structure discussed but not yet built. Tax-report XLSX exports present but don't yet include report-line columns.
+
+Phase 4: not started. Multi-client, year-end close, and adjusting entries are all future work. The append-only ledger and hash chain are already compatible with Phase 4 requirements.
+
+Core architecture
+ledger.py — the accounting engine. All financial math lives here, isolated from the UI. Key properties:
+
+Append-only immutable ledger: void_transaction() creates a perfect reversal entry and marks the original voided; edit_transaction() voids the original and creates a new row. No UPDATE or DELETE on transaction data.
+
+SQLCipher-encrypted via a Data Encryption Key (DEK), which is not the passphrase.
+
+Every change to sql_transaction_history is cryptographically hash-chained (SHA-256 of row content + previous row's hash), tamper-evident.
+
+record_transaction() is the single write path for all transactions.
+
+An atomic-batch mechanism (begin_transaction / commit_transaction / rollback_transaction) is used by mobile sync to post a batch as one unit, with in-memory ledger state only updated on successful commit.
+
+crypto_envelope.py — DEK/KEK envelope. The DEK is a random 256-bit key that encrypts the database. The DEK itself is wrapped twice — once by a KEK derived from the primary passphrase, once by a KEK derived from a separate recovery passphrase. Heavy lifting (Argon2id, AES-GCM, mlock, zeroize) is done in a compiled Rust module (cogni_vault). Instant passphrase rotation is possible because the DB is keyed by the DEK, not the passphrase.
+
+protocol.py — the "cogni-transfer" mobile sync protocol. SPAKE2-based pairing, Ed25519 identity pinning (trust-on-first-use), X25519 ephemeral reconnect handshake, ReplayGuard for message replay detection, PairingAttemptLimiter with persisted backoff, DesktopLedger for idempotent batch acceptance with conflict detection.
+
+desktop_sync_server.py — ephemeral LAN HTTP server (0.0.0.0:40317) that receives encrypted transaction batches from the Android app. Auto-shuts down on successful sync completion (ctx.request_shutdown() is called after commit), plus a 5-minute wall-clock timer as a hard ceiling. Auth is bearer token + session_id on every endpoint. Rejection reasons sent to the phone are sanitized to fixed strings; full detail goes to desktop logs only.
+
+ui_main.py — main window with a CollapsibleSidebar and QStackedWidget. Tabs: Overview, Reconciliation, Transactions, Add/Edit, Budgets, Charts, Reports, Accounts, Balance Sheet, Category Rules, Taxes, Mobile Sync, Logs, Audit Log, Settings. Dark mode and light mode QSS live here as LIGHT_MODE_QSS / DARK_MODE_QSS.
+
+Tab modules (extracted from ui_main.py over time): ui_transactions_tab.py, add_edit_tab.py, budgets_tab.py, reports_tab.py, reconcile_tab.py, category_rules_tab.py, tax_tab.py, sync_tab.py, audit_tab.py, log_tab.py, settings_tab.py.
+
+budget_engine.py — pure derivation functions for the envelope/ZBB budget engine (derive_expected_income, envelope_available, ready_to_assign, net_assignment_in_month). Imports from ledger.py but has no side effects.
+
+html_renderers.py — pure functions generating HTML reports. No PyQt6, no ledger dependency. Called by tabs with data structures.
+
+merchant_normalization.py — pure, deterministic function turning a raw bank description into (merchant_key, merchant_display). No network, no external data.
+
+audit.py — read-only AuditLogReader for the audit history table. Opens its own SQLCipher connection.
+
+config.py — centralized path configuration and atomic secure file I/O (atomic_secure_write, create_secure_file). Directory layout is ~/CogniSuite/ with subdirs BudgetData/, BackupData/, SystemState/, .SecurityBackup/, TaxTemplates/.
+
+Test suite — ~22 files in test/, run via pytest. Includes a weekly ledger-invariant suite (test_core_finance, test_ledger_logic, test_ledger_reconciliation_history, test_balance_invariant_fuzz) and a quarterly deep-audit suite (crypto pipeline, forensic integrity, MITM simulation). Automated integrity checks run on app start with a 7-day weekly cooldown and 90-day deep cooldown; results surface in a notification center.
+
+Key design decisions and invariants
+Money is always Decimal, never float. money() quantizes to CENT with ROUND_HALF_UP. SQLite stores it as TEXT.
+
+Append-only. No destructive operations on transaction data. Everything else cascades off that.
+
+Simple Mode is a presentation concern only. Storage is always full-fidelity; modes only affect what the UI exposes. This applies to merchant memory (granular merchant_key always stored; Simple Mode pools on display), report lines (always stored; Simple Mode renders flat), and everything future.
+
+The UI contains no financial math. Math lives in ledger.py and, when it's pure derivation, in budget_engine.py. The UI passes values, formats them, and displays results.
+
+Hash chain is the tamper evidence. Anything that touches sql_transaction_history must go through _log_history, which is only callable with the same cursor as the change it describes.
+
+Account has account_type (mandatory, drives DR/CR) and report_line (optional, presentation). Subcategory is derived from report line via a lookup table — never stored, never chosen by the user. The five account_type values are Asset, Liability, Equity, Revenue, Expense. NORMAL_BALANCES maps each to DR or CR.
+
+Report lines are a fixed enum (REPORT_LINE_METADATA in ledger.py), not user-extensible. Each report line implies exactly one (account_type, subcategory) pair. The user picks a report line from a dropdown filtered by type; the subcategory follows automatically.
+
+The reporting architecture is heading toward a shared ReportSection / ReportLine structure so that balance sheet, P&L, equity statement, and trial balance all consume the same data shape and different renderers (HTML, PDF via ReportLab, XLSX via pandas/openpyxl) walk it. Not built yet; the current html_renderers.py still has bespoke functions per report.
+
+Style conventions: thorough docstrings explaining why, not just what; comments that flag subtle security implications; explicit "this is intentional, not a bug" notes where behavior looks surprising.
+
+Completed work in the most recent session
+persist=False orphan analysis. Confirmed that record_transaction's persist parameter is dead code — every call site passes True, and nothing in the test suite exercises False. Decision: leave it in place; it's inert and harmless, and a full removal would require coordinated edits across seven call sites including two that swallow TypeError via try/except. Deferred indefinitely.
+
+_sanitize_for_excel bug fixed. The original had an early return that made the formula-injection prefix check unreachable, and the XML strip wasn't being assigned back to value. Both fixed. This is a low-priority issue because the app only imports CSV/OFX/PDF — not XLSX — so xlsx injection would require someone to already have a payload in the ledger.
+
+_sanitize_for_csv added and wired into export_journal_csv. CSV formula-injection is a wider concern than XLSX because the CSV export is opened in spreadsheet apps directly. Numbers are exempted so Debit/Credit round-tripping survives.
+
+audit.py three bugs fixed. _row_to_dict unpacked 7 values but the SELECT returned 8 (missing change_reason); change_reason was referenced in the return dict as an undefined name; _build_where supplied 2 SQL bind params for a 3-placeholder search clause. All three fixed. This was the cause of a failing weekly audit and a broken Audit Log tab.
+
+Budget engine wired into the UI. budget_engine.py was fully implemented but had no importers. Rewrote budgets_tab.py to drive the envelope engine end-to-end (income plan, Ready to Assign, envelope assignment, moves, activity table). Connected tab_budgets.data_modified to refresh_overview in ui_main.py.
+
+Report line feature (Shape A) implemented. Three-tier model: account_type (mandatory, DR/CR) → report_line (optional, stored) → account name. Subcategory is derived. Fixed enum in REPORT_LINE_METADATA. Ledger-side API: get_valid_report_lines, set_account_report_line, get_account_hierarchy, get_accounts_grouped_for_report (3-level: {type: {subcategory: {report_line: [names]}}}), and Account.subcategory as a derived property. update_account clears the report line if the type changes and the line no longer applies.
+
+Balance sheet renderer updated to consume the grouped structure with flat fallback. Renders:
+
+Section header ("ASSETS")
+
+Subcategory header (only if more than one exists in that section)
+
+Report line header (only if two or more accounts share it)
+
+Account rows (indented)
+
+Subtotal — <report line> when multi-account
+
+TOTAL <section>
+
+Unclassified accounts render flat at the bottom of their section, no fake label. Single-account report lines collapse to just the account name with no subtotal row. The function takes grouped and simple_mode params; ui_main.py passes both, and simple_mode defaults to getattr(self, 'is_simple_mode', False) so it's a no-op until the mode flag exists.
+
+Outstanding items, in rough priority order
+Simple Mode infrastructure. A mode flag needs to be added — likely stored in ui_config.json alongside theme, read via a _load_saved_mode() helper in BudgetApp, propagated to tabs via set_simple_mode(bool) on the ones that care, following the exact pattern of dark mode. Not to be built until Pro Mode is complete across the tabs.
+
+P&L subtotaling. monthly_income_expense_report and render_monthly_report_html currently produce a flat Revenue/Expense listing. Gross Profit, Operating Income, and Net Income subtotals are wanted. Deferred until the report-builder module lands.
+
+ReportSection / ReportLine shared structure for balance sheet, P&L, equity statement, trial balance. Design sketched: a dataclass with label, amount, indent, is_total, is_section_header, accounts, report_line, subcategory. Builders return List[ReportSection]; renderers walk it. This is the piece that makes the four-report architecture coherent instead of each tab growing bespoke formatting.
+
+Equity statement, trial balance renderers. Trial balance stays flat (audit view). Equity statement uses the grouping.
+
+XLSX exports with report line / subcategory columns. export_tax_report_xlsx and export_monthly_income_expense_xlsx could add a column showing the report line of each account's activity.
+
+Budget engine invariant tests. A test file was drafted (test_budget_engine_invariants.py) verifying that budget operations never perturb the transaction ledger (fingerprint trial balance, transaction count, per-account balances before and after every budget operation). Not confirmed as added to the suite.
+
+netifaces → netifaces2 swap. Original netifaces is abandoned and doesn't build on Python 3.14. netifaces2 is a maintained fork with the same API for the calls the code uses (interfaces(), ifaddresses(), AF_INET). Only the packaging name changes; the import stays import netifaces. Deferred until tested on the target machine.
+
+Dialog ↔ update_account contract. The account dialog should call set_account_report_line separately from update_account (two ledger methods, sequenced) rather than widening update_account's signature. The current state of the dialog code may or may not be aligned with this — worth verifying.
+
+Changelog update for 0.9.6. A draft entry exists (envelope budgeting + audit reader repair + sanitizer hardening). The changelog itself also has a duplicated [0.9.4] and orphaned [0.9.3] heading near the top that should be de-duplicated.
+
+Working style notes for the assistant
+The user prefers surgical edits with exact find/replace anchors over whole-file replacements. They sometimes work from a tablet where large pastes are error-prone; when a file is long, a set of anchored edits is better than one big paste.
+
+They value honest assessments over reassurance. If something is fine, say so plainly. If something is a real bug, say so without hedging. When uncertain, mark the uncertainty explicitly rather than assuming.
+
+They verify with tests after each change. Assume any code change will be followed by running the suite and possibly a smoke test in the running app.
+
+They think about future-proofing and architecture more than most. Design proposals that gesture at future features (Simple Mode, additional reports) land well; quick fixes that paint the codebase into a corner do not.
+
+The changelog uses a specific voice: bullet-per-change, sectioned by 🏗️ Architectural / ✨ Functional / 🔒 Security / 🎨 UI/UX / 🐛 Bug Fixes, explains reasoning concisely. Match that when drafting entries.
+
+When they say "plan first" they mean it — design discussion is expected before code. When they say "let's implement" they want code, not another round of design.
+
+What not to do
+Don't propose wholesale rewrites of ledger.py. It's the core engine and it's stable.
+
+Don't suggest removing persist=False — it's been analyzed and deliberately deferred.
+
+Don't add migration guards for greenfield schema changes. Pre-alpha, no shipped users, fresh DB on schema change is the strategy. (sql_transactions guards predate this decision and are kept; new column additions skip the guard.)
+
+Don't introduce Simple Mode code paths until Simple Mode is actually being built. Right now everything is Pro Mode; Simple Mode is planned, not present.
+
+Don't propose user-extensible report lines or a GnuCash-style nested account tree — both have been explicitly ruled out.

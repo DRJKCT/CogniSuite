@@ -6,9 +6,8 @@ accounting. This module is read-only and only touches the
 sql_transaction_history table. It opens its own SQLCipher connections
 using the same passphrase as the main ledger, so it doesn't need to
 share state with the GeneralLedger instance.
-audit.py ver 0.1
-For CogniFinance ver 1.8
-
+audit.py ver 0.2
+For CogniFinance ver 1.95
 """
 import json
 from typing import List, Dict, Any, Optional
@@ -39,7 +38,7 @@ class AuditLogReader:
 
     @staticmethod
     def _row_to_dict(row) -> Dict[str, Any]:
-        hid, tx_id, change_type, changed_at, date, description, lines_json = row
+        hid, tx_id, change_type, changed_at, date, description, lines_json, change_reason = row
         return {
             "id": hid,
             "tx_id": tx_id,
@@ -48,6 +47,7 @@ class AuditLogReader:
             "date": date,
             "description": description,
             "lines": json.loads(lines_json) if lines_json else [],
+            "change_reason": change_reason,
         }
 
     @staticmethod
@@ -60,10 +60,11 @@ class AuditLogReader:
         if change_type in ("created", "updated", "deleted"):
             clauses.append("change_type = ?"); params.append(change_type)
         if search:
-            # Match against description OR any account name embedded in lines_json.
-            clauses.append("(description LIKE ? OR lines_json LIKE ?)")
+            # Match against description, any account name embedded in
+            # lines_json, or the change_reason note.
+            clauses.append("(description LIKE ? OR lines_json LIKE ? OR change_reason LIKE ?)")
             like = f"%{search}%"
-            params.extend([like, like])
+            params.extend([like, like, like])
         return clauses, params
 
     def get_audit_log(
@@ -82,7 +83,7 @@ class AuditLogReader:
             where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
             params.extend([limit, offset])
             cur.execute(
-                f"SELECT id, tx_id, change_type, changed_at, date, description, lines_json "
+                f"SELECT id, tx_id, change_type, changed_at, date, description, lines_json, change_reason "
                 f"FROM sql_transaction_history {where} "
                 f"ORDER BY id DESC LIMIT ? OFFSET ?",
                 params,
@@ -113,7 +114,7 @@ class AuditLogReader:
         conn, cur = self._connect()
         try:
             cur.execute(
-                "SELECT id, tx_id, change_type, changed_at, date, description, lines_json "
+                "SELECT id, tx_id, change_type, changed_at, date, description, lines_json, change_reason "
                 "FROM sql_transaction_history WHERE tx_id = ? ORDER BY id",
                 (tx_id,),
             )

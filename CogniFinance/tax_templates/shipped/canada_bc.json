@@ -1,0 +1,31 @@
+{
+  "cognifinance_tax_template": 1,
+  "template_type": "provincial_base",
+  "template_id": "canada_bc",
+  "display_name": "British Columbia (2025)",
+  "description": "British Columbia provincial income tax brackets for the 2025 tax year.",
+  "tax_year": 2025,
+
+  "provincial_brackets": [
+    {"threshold": 0,       "rate": 0.0506},
+    {"threshold": 49279,   "rate": 0.0770},
+    {"threshold": 98560,   "rate": 0.1050},
+    {"threshold": 113158,  "rate": 0.1229},
+    {"threshold": 137407,  "rate": 0.1470},
+    {"threshold": 186306,  "rate": 0.1680},
+    {"threshold": 259829,  "rate": 0.2050}
+  ],
+
+  "module_compatibility": {},
+
+  "levies": [],
+
+  "credits": [
+    {
+      "name": "BC Basic Personal Amount",
+      "type": "rate",
+      "amount": 12580,
+      "rate": 0.0506
+    }
+  ]
+}

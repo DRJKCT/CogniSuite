@@ -1,0 +1,32 @@
+{
+  "cognifinance_tax_template": 1,
+  "template_type": "provincial_base",
+  "template_id": "canada_saskatchewan",
+  "display_name": "Saskatchewan (2026)",
+  "description": "Saskatchewan provincial income tax brackets and Basic Personal Amount for the 2026 tax year.",
+  "tax_year": 2026,
+  "provincial_brackets": [
+    {
+      "threshold": 0,
+      "rate": 0.105
+    },
+    {
+      "threshold": 54532,
+      "rate": 0.125
+    },
+    {
+      "threshold": 155805,
+      "rate": 0.145
+    }
+  ],
+  "module_compatibility": {},
+  "levies": [],
+  "credits": [
+    {
+      "name": "Saskatchewan Basic Personal Amount",
+      "type": "rate",
+      "amount": 19491.0,
+      "rate": 0.105
+    }
+  ]
+}

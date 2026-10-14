@@ -1,0 +1,42 @@
+{
+  "cognifinance_tax_template": 1,
+  "template_type": "provincial_base",
+  "template_id": "canada_ontario",
+  "display_name": "Ontario (2025)",
+  "description": "Ontario provincial income tax brackets and Ontario Health Premium for the 2025 tax year.",
+  "tax_year": 2025,
+
+  "provincial_brackets": [
+    {"threshold": 0,      "rate": 0.0505},
+    {"threshold": 52886,  "rate": 0.0915},
+    {"threshold": 105775, "rate": 0.1116},
+    {"threshold": 150000, "rate": 0.1216},
+    {"threshold": 220000, "rate": 0.1316}
+  ],
+
+  "module_compatibility": {},
+
+  "levies": [
+    {
+      "name": "Ontario Health Premium",
+      "type": "tiered",
+      "applies_to": ["*"],
+      "tiers": [
+        {"min_income": 20000,  "premium": 300},
+        {"min_income": 36000,  "premium": 450},
+        {"min_income": 48000,  "premium": 600},
+        {"min_income": 72000,  "premium": 750},
+        {"min_income": 200000, "premium": 900}
+      ]
+    }
+  ],
+
+  "credits": [
+    {
+      "name": "Ontario Basic Personal Amount",
+      "type": "rate",
+      "amount": 12399,
+      "rate": 0.0505
+    }
+  ]
+}

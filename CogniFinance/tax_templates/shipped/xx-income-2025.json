@@ -1,0 +1,23 @@
+{
+  "cognifinance_tax_template": 4,
+  "template_type": "income_module",
+  "template_id": "xx-income-2025",
+  "display_name": {"en": "Fictionland income buckets"},
+  "valid_from": 2025,
+  "buckets": {
+    "employment": {"primitive": "inclusion_rate", "rate": 1.0, "label": {"en": "Employment income"}},
+    "medical": {"primitive": "inclusion_rate", "rate": 1.0, "label": {"en": "Medical expenses"}},
+    "foreign_income": {"primitive": "inclusion_rate", "rate": 1.0, "label": {"en": "Foreign income"}},
+    "preference_items": {"primitive": "inclusion_rate", "rate": 0.0, "label": {"en": "Preference items"}},
+    "capital_gains": {
+      "primitive": "separate_rate",
+      "label": {"en": "Capital gains"},
+      "exempt_amount": 3000,
+      "schedules": {"national": {"brackets": [
+        {"threshold": 0, "rate": 0.0},
+        {"threshold": 40000, "rate": 0.15},
+        {"threshold": 200000, "rate": 0.20}
+      ]}}
+    }
+  }
+}

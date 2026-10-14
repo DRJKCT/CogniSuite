@@ -1,0 +1,44 @@
+{
+  "cognifinance_tax_template": 1,
+  "template_type": "provincial_base",
+  "template_id": "canada_alberta",
+  "display_name": "Alberta (2026)",
+  "description": "Alberta provincial income tax brackets and Basic Personal Amount for the 2026 tax year.",
+  "tax_year": 2026,
+  "provincial_brackets": [
+    {
+      "threshold": 0,
+      "rate": 0.08
+    },
+    {
+      "threshold": 61200,
+      "rate": 0.1
+    },
+    {
+      "threshold": 154259,
+      "rate": 0.12
+    },
+    {
+      "threshold": 185111,
+      "rate": 0.13
+    },
+    {
+      "threshold": 246813,
+      "rate": 0.14
+    },
+    {
+      "threshold": 370220,
+      "rate": 0.15
+    }
+  ],
+  "module_compatibility": {},
+  "levies": [],
+  "credits": [
+    {
+      "name": "Alberta Basic Personal Amount",
+      "type": "rate",
+      "amount": 22323.0,
+      "rate": 0.08
+    }
+  ]
+}

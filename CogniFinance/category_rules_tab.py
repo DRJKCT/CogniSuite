@@ -23,6 +23,7 @@ class CategoryRulesTab(QWidget):
         self.rule_edit_id = None
         self._init_ui()
         self.refresh_rules_table()
+        self.refresh_blacklist_table()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -84,6 +85,38 @@ class CategoryRulesTab(QWidget):
 
         layout.addWidget(self.rules_table)
 
+        # --- Blacklisted Patterns ---
+        # Point 6: blacklisting must be visible and reversible in the UI.
+        # This is also the one place Simple Mode pooling could otherwise
+        # silently blacklist a granular pattern the user never
+        # individually saw -- this list always shows the real, granular
+        # (merchant_key, category) rows, regardless of whether the Red
+        # rating that created them came from a pooled Simple Mode view.
+        blacklist_box = QGroupBox("Blacklisted Patterns")
+        blacklist_layout = QVBoxLayout()
+
+        self.blacklist_table = QTableWidget()
+        self.blacklist_table.setColumnCount(3)
+        self.blacklist_table.setHorizontalHeaderLabels(["Merchant", "Category", "Blacklisted At"])
+        bl_header = self.blacklist_table.horizontalHeader()
+        bl_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        bl_header.setStretchLastSection(True)
+        bl_header.setHighlightSections(False)
+        self.blacklist_table.verticalHeader().setVisible(False)
+        self.blacklist_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.blacklist_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        blacklist_layout.addWidget(self.blacklist_table)
+
+        bl_btn_row = QHBoxLayout()
+        btn_unblacklist = QPushButton("Un-blacklist Selected")
+        btn_unblacklist.clicked.connect(self.unblacklist_selected)
+        bl_btn_row.addWidget(btn_unblacklist)
+        bl_btn_row.addStretch()
+        blacklist_layout.addLayout(bl_btn_row)
+
+        blacklist_box.setLayout(blacklist_layout)
+        layout.addWidget(blacklist_box)
+
     def _populate_category_combo(self):
         """Populate the category dropdown with all accounts."""
         self.rule_category.clear()
@@ -133,6 +166,31 @@ class CategoryRulesTab(QWidget):
         idx = self.rule_enabled.findData(rule.enabled)
         if idx >= 0:
             self.rule_enabled.setCurrentIndex(idx)
+
+    def refresh_blacklist_table(self):
+        """Refresh the Blacklisted Patterns table from the ledger."""
+        entries = self.gl.get_merchant_blacklist()
+        self.blacklist_table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            self.blacklist_table.setItem(row, 0, QTableWidgetItem(entry["merchant_key"]))
+            self.blacklist_table.setItem(row, 1, QTableWidgetItem(entry["category"]))
+            self.blacklist_table.setItem(row, 2, QTableWidgetItem(entry["blacklisted_at"] or ""))
+
+    def unblacklist_selected(self):
+        """Reverse the selected blacklist entry -- always single-row/granular (point 6)."""
+        selected = self.blacklist_table.selectedItems()
+        if not selected:
+            QMessageBox.information(self, "No selection", "Please select a blacklisted pattern to reverse.")
+            return
+        row = selected[0].row()
+        merchant_key = self.blacklist_table.item(row, 0).text()
+        category = self.blacklist_table.item(row, 1).text()
+
+        ok, msg = self.gl.unblacklist_pattern(merchant_key, category)
+        if ok:
+            self.refresh_blacklist_table()
+        else:
+            QMessageBox.warning(self, "Un-blacklist failed", msg)
 
     def add_category_rule(self):
         """Add a new category rule."""

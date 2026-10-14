@@ -797,6 +797,7 @@ def _handle_sync(ctx: SyncContext, data: dict) -> tuple:
                 if not ok:
                     raise RuntimeError(f"Ledger rejected {tx_id}: {msg}")
             ctx.gl.commit_transaction()
+            ctx.request_shutdown()
             if ctx.on_sync_completed:
                 try:
                     ctx.on_sync_completed()

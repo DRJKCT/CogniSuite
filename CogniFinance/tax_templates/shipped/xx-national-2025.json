@@ -1,0 +1,61 @@
+{
+  "cognifinance_tax_template": 4,
+  "template_type": "jurisdiction_base",
+  "template_id": "xx-national-2025",
+  "display_name": {"en": "Fictionland (illustrative)"},
+  "description": {"en": "FICTIONAL COUNTRY WITH MADE-UP FIGURES. Demonstrates filing-status variants, a separate stacked capital-gains schedule, refundable and foreign-tax credits, a minimum-tax alternative calculation, a post-credit surcharge, and carry-forwards. Not real tax law."},
+  "jurisdiction": {"country": "XX", "country_name": {"en": "Fictionland"}, "level": "national"},
+  "currency": "XXX",
+  "tax_year": 2025,
+  "module_compatibility": {"xx-income-2025": [{"version": 2025, "valid_until": null}]},
+  "brackets": [
+    {"threshold": 0, "rate": 0.10},
+    {"threshold": 50000, "rate": 0.20},
+    {"threshold": 150000, "rate": 0.30}
+  ],
+  "variants": {
+    "label": {"en": "Filing status"},
+    "default": "single",
+    "options": {
+      "single": {"label": {"en": "Single"}},
+      "joint": {
+        "label": {"en": "Married, filing jointly"},
+        "brackets": [
+          {"threshold": 0, "rate": 0.10},
+          {"threshold": 100000, "rate": 0.20},
+          {"threshold": 300000, "rate": 0.30}
+        ]
+      }
+    }
+  },
+  "credits": [
+    {"name": "low_income_credit", "label": {"en": "Low-income credit (refundable)"}, "type": "rate", "amount": 1500, "rate": 1.0, "refundable": true},
+    {"name": "medical_credit", "label": {"en": "Medical expense credit"}, "type": "threshold_bucket", "applies_to": ["medical"], "income_reference": "net_income", "fixed_threshold": 2000, "pct_threshold": 0.03, "credit_rate": 0.15},
+    {"name": "foreign_tax_credit", "label": {"en": "Foreign tax credit"}, "type": "foreign_tax_credit", "applies_to": ["foreign_income"], "tax_paid": {"user_input": "foreign_tax_paid"}}
+  ],
+  "alternatives": [
+    {
+      "name": "minimum_tax",
+      "label": {"en": "Minimum tax"},
+      "combine": "max",
+      "base": "adjusted_taxable_income",
+      "add_back": ["preference_items"],
+      "exemption": {"type": "tapered", "base": 40000, "threshold": 120000, "reduction_rate": 0.25, "floor": 0},
+      "brackets": [{"threshold": 0, "rate": 0.20}]
+    }
+  ],
+  "adjustments": [
+    {
+      "name": "high_income_surcharge",
+      "label": {"en": "High-income surcharge"},
+      "stage": "post_credit",
+      "type": "threshold_rates",
+      "combine": "sum",
+      "components": [{"rate": 0.05, "threshold": 30000}]
+    }
+  ],
+  "carryforwards": [
+    {"name": "net_capital_loss_carryforward", "label": {"en": "Net capital loss"}, "source": "negative_bucket", "bucket": "capital_gains"},
+    {"name": "unused_credit_carryforward", "label": {"en": "Unused credits"}, "source": "unused_credits"}
+  ]
+}

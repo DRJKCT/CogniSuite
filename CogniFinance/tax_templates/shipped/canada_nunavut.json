@@ -1,0 +1,36 @@
+{
+  "cognifinance_tax_template": 1,
+  "template_type": "provincial_base",
+  "template_id": "canada_nunavut",
+  "display_name": "Nunavut (2026)",
+  "description": "Nunavut provincial income tax brackets and Basic Personal Amount for the 2026 tax year.",
+  "tax_year": 2026,
+  "provincial_brackets": [
+    {
+      "threshold": 0,
+      "rate": 0.04
+    },
+    {
+      "threshold": 55801,
+      "rate": 0.07
+    },
+    {
+      "threshold": 111602,
+      "rate": 0.09
+    },
+    {
+      "threshold": 181439,
+      "rate": 0.115
+    }
+  ],
+  "module_compatibility": {},
+  "levies": [],
+  "credits": [
+    {
+      "name": "Nunavut Basic Personal Amount",
+      "type": "rate",
+      "amount": 19274.0,
+      "rate": 0.04
+    }
+  ]
+}

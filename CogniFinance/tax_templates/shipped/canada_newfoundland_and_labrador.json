@@ -1,0 +1,52 @@
+{
+  "cognifinance_tax_template": 1,
+  "template_type": "provincial_base",
+  "template_id": "canada_newfoundland_and_labrador",
+  "display_name": "Newfoundland and Labrador (2026)",
+  "description": "Newfoundland and Labrador provincial income tax brackets and Basic Personal Amount for the 2026 tax year.",
+  "tax_year": 2026,
+  "provincial_brackets": [
+    {
+      "threshold": 0,
+      "rate": 0.087
+    },
+    {
+      "threshold": 44678,
+      "rate": 0.145
+    },
+    {
+      "threshold": 89354,
+      "rate": 0.158
+    },
+    {
+      "threshold": 159528,
+      "rate": 0.178
+    },
+    {
+      "threshold": 223340,
+      "rate": 0.198
+    },
+    {
+      "threshold": 285319,
+      "rate": 0.208
+    },
+    {
+      "threshold": 570638,
+      "rate": 0.213
+    },
+    {
+      "threshold": 1141275,
+      "rate": 0.218
+    }
+  ],
+  "module_compatibility": {},
+  "levies": [],
+  "credits": [
+    {
+      "name": "Newfoundland and Labrador Basic Personal Amount",
+      "type": "rate",
+      "amount": 11067.0,
+      "rate": 0.087
+    }
+  ]
+}

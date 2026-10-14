@@ -1,0 +1,32 @@
+{
+  "cognifinance_tax_template": 1,
+  "template_type": "provincial_base",
+  "template_id": "canada_manitoba",
+  "display_name": "Manitoba (2026)",
+  "description": "Manitoba provincial income tax brackets and Basic Personal Amount for the 2026 tax year.",
+  "tax_year": 2026,
+  "provincial_brackets": [
+    {
+      "threshold": 0,
+      "rate": 0.108
+    },
+    {
+      "threshold": 47564,
+      "rate": 0.1275
+    },
+    {
+      "threshold": 101200,
+      "rate": 0.174
+    }
+  ],
+  "module_compatibility": {},
+  "levies": [],
+  "credits": [
+    {
+      "name": "Manitoba Basic Personal Amount",
+      "type": "rate",
+      "amount": 15780.0,
+      "rate": 0.108
+    }
+  ]
+}

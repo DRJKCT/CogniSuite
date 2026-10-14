@@ -1,0 +1,108 @@
+{
+  "cognifinance_tax_template": 5,
+  "template_type": "jurisdiction_base",
+  "template_id": "canada_ontario",
+  "display_name": "Ontario (2026)",
+  "description": "Ontario provincial income tax brackets, Basic Personal Amount, two-tier surtax, and Ontario Health Premium for the 2026 tax year. Source: Canada Revenue Agency, T4032ON Payroll Deductions Tables, https://www.canada.ca/en/revenue-agency/services/forms-publications/payroll/t4032-payroll-deductions-tables/t4032on-jan/t4032on-january-general-information.html . Does NOT include the Ontario Tax Reduction (low-income credit) or Ontario dividend/donation tax credits. Verify all figures before relying on them.",
+  "jurisdiction": {
+    "country": "CA",
+    "region": "ON",
+    "level": "regional",
+    "level_label": {
+      "en": "Provincial"
+    }
+  },
+  "currency": "CAD",
+  "tax_year": 2026,
+  "brackets": [
+    {
+      "threshold": 0,
+      "rate": 0.0505
+    },
+    {
+      "threshold": 53891,
+      "rate": 0.0915
+    },
+    {
+      "threshold": 107785,
+      "rate": 0.1116
+    },
+    {
+      "threshold": 150000,
+      "rate": 0.1216
+    },
+    {
+      "threshold": 220000,
+      "rate": 0.1316
+    }
+  ],
+  "module_compatibility": {},
+  "credits": [
+    {
+      "name": "Ontario Basic Personal Amount",
+      "type": "rate",
+      "amount": 12989.0,
+      "rate": 0.0505
+    }
+  ],
+  "adjustments": [
+    {
+      "name": "ontario_surtax",
+      "label": {
+        "en": "Ontario surtax"
+      },
+      "stage": "post_credit",
+      "type": "threshold_rates",
+      "combine": "sum",
+      "components": [
+        {
+          "rate": 0.2,
+          "threshold": 5818
+        },
+        {
+          "rate": 0.56,
+          "threshold": 7446
+        }
+      ]
+    }
+  ],
+  "levies": [
+    {
+      "name": "ontario_health_premium",
+      "label": {
+        "en": "Ontario Health Premium"
+      },
+      "type": "phased_bands",
+      "applies_to": [
+        "adjusted_taxable_income"
+      ],
+      "segments": [
+        {
+          "threshold": 20000,
+          "rate": 0.06,
+          "cap": 25000
+        },
+        {
+          "threshold": 36000,
+          "rate": 0.06,
+          "cap": 38500
+        },
+        {
+          "threshold": 48000,
+          "rate": 0.25,
+          "cap": 48600
+        },
+        {
+          "threshold": 72000,
+          "rate": 0.25,
+          "cap": 72600
+        },
+        {
+          "threshold": 200000,
+          "rate": 0.25,
+          "cap": 200600
+        }
+      ]
+    }
+  ]
+}

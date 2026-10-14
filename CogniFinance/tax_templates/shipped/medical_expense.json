@@ -1,0 +1,11 @@
+{
+  "template_id": "medical_expenses",
+  "title": "Out-of-Pocket Medical (Line 33099)",
+  "description": "Eligible medical expenses for you, your spouse, and dependent children.",
+  "categories": {
+    "Dental (Out of Pocket)": ["Medical: Dental"],
+    "Vision (Out of Pocket)": ["Medical: Vision"],
+    "Prescriptions": ["Medical: Rx"],
+    "Other Medical": ["Medical: Other"]
+  }
+}

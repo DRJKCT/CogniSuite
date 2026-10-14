@@ -1,0 +1,59 @@
+{
+  "cognifinance_tax_template": 4,
+  "template_type": "jurisdiction_base",
+  "template_id": "de-national-2025",
+  "display_name": {"en": "Germany 2025", "de": "Deutschland 2025"},
+  "description": {"en": "SIMPLIFIED ILLUSTRATION of the German income tax tariff (polynomial zones), income splitting for couples, and the solidarity surcharge with its phase-in. Church tax, allowances for children and other reliefs are not modeled, and the surcharge base is not separately rounded. Verify every figure against official sources before relying on it."},
+  "jurisdiction": {"country": "DE", "country_name": {"en": "Germany", "de": "Deutschland"}, "level": "national"},
+  "currency": "EUR",
+  "tax_year": 2025,
+  "rounding": {"mode": "down", "increment": "1"},
+  "module_compatibility": {"de-income-2025": [{"version": 2025, "valid_until": null}]},
+  "tariff": {
+    "income_rounding": {"mode": "down", "increment": 1},
+    "zones": [
+      {"from": 0,      "coefficients": [0]},
+      {"from": 12097,  "offset": 12096, "divisor": 10000, "coefficients": [0, 1400, 932.30]},
+      {"from": 17444,  "offset": 17443, "divisor": 10000, "coefficients": [1015.13, 2397, 176.64]},
+      {"from": 68481,  "coefficients": [-10911.92, 0.42]},
+      {"from": 277826, "coefficients": [-19246.67, 0.45]}
+    ]
+  },
+  "adjustments": [
+    {
+      "name": "solidarity_surcharge",
+      "label": {"en": "Solidarity surcharge", "de": "Solidaritätszuschlag"},
+      "stage": "post_credit",
+      "type": "threshold_rates",
+      "combine": "min",
+      "components": [
+        {"rate": 0.055, "threshold": 0},
+        {"rate": 0.119, "threshold": 19950}
+      ]
+    }
+  ],
+  "variants": {
+    "label": {"en": "Tax class", "de": "Veranlagung"},
+    "default": "single",
+    "options": {
+      "single": {"label": {"en": "Single", "de": "Einzelveranlagung"}},
+      "joint": {
+        "label": {"en": "Married, joint assessment", "de": "Zusammenveranlagung"},
+        "adjustments": [
+          {"name": "splitting", "stage": "scale", "factor": 2},
+          {
+            "name": "solidarity_surcharge",
+            "label": {"en": "Solidarity surcharge", "de": "Solidaritätszuschlag"},
+            "stage": "post_credit",
+            "type": "threshold_rates",
+            "combine": "min",
+            "components": [
+              {"rate": 0.055, "threshold": 0},
+              {"rate": 0.119, "threshold": 39900}
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

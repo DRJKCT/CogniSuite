@@ -1,0 +1,48 @@
+{
+  "cognifinance_tax_template": 1,
+  "template_type": "provincial_base",
+  "template_id": "canada_british_columbia",
+  "display_name": "British Columbia (2026)",
+  "description": "British Columbia provincial income tax brackets and Basic Personal Amount for the 2026 tax year.",
+  "tax_year": 2026,
+  "provincial_brackets": [
+    {
+      "threshold": 0,
+      "rate": 0.056
+    },
+    {
+      "threshold": 50363,
+      "rate": 0.077
+    },
+    {
+      "threshold": 100728,
+      "rate": 0.105
+    },
+    {
+      "threshold": 115648,
+      "rate": 0.1229
+    },
+    {
+      "threshold": 140430,
+      "rate": 0.147
+    },
+    {
+      "threshold": 190405,
+      "rate": 0.168
+    },
+    {
+      "threshold": 265545,
+      "rate": 0.205
+    }
+  ],
+  "module_compatibility": {},
+  "levies": [],
+  "credits": [
+    {
+      "name": "British Columbia Basic Personal Amount",
+      "type": "rate",
+      "amount": 12932.0,
+      "rate": 0.056
+    }
+  ]
+}

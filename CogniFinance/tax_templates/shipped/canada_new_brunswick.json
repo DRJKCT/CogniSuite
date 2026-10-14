@@ -1,0 +1,36 @@
+{
+  "cognifinance_tax_template": 1,
+  "template_type": "provincial_base",
+  "template_id": "canada_new_brunswick",
+  "display_name": "New Brunswick (2026)",
+  "description": "New Brunswick provincial income tax brackets and Basic Personal Amount for the 2026 tax year.",
+  "tax_year": 2026,
+  "provincial_brackets": [
+    {
+      "threshold": 0,
+      "rate": 0.094
+    },
+    {
+      "threshold": 52333,
+      "rate": 0.14
+    },
+    {
+      "threshold": 104666,
+      "rate": 0.16
+    },
+    {
+      "threshold": 193861,
+      "rate": 0.195
+    }
+  ],
+  "module_compatibility": {},
+  "levies": [],
+  "credits": [
+    {
+      "name": "New Brunswick Basic Personal Amount",
+      "type": "rate",
+      "amount": 13396.0,
+      "rate": 0.094
+    }
+  ]
+}

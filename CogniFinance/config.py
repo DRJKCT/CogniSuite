@@ -10,10 +10,17 @@ Directory layout:
         /SystemState                     state files
         /.SecurityBackup/                all hidden config
 """
-import os
+import csv
 import json
+import logging
+import os
+import re
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Base directory (override with COGNIFINANCE_BASE_DIR env var)
@@ -41,6 +48,7 @@ DB_PATH = BUDGET_DIR / "ledger_storage.db"
 # ---------------------------------------------------------------------------
 NOTIFICATIONS_PATH = STATE_DIR / "notifications.json"
 BACKUP_STATUS_PATH = STATE_DIR / "backup_status.json"
+UI_CONFIG_PATH = STATE_DIR / "ui_config.json"
 
 # ---------------------------------------------------------------------------
 # Security (all live in .SecurityBackup/)
@@ -55,6 +63,114 @@ PAIRING_LOCKOUT_PATH = SECURITY_DIR / ".cognifinance_pairing_lockout.json"
 TRUST_STORE_PATH = SECURITY_DIR / ".cognifinance_trusted_devices.json"
 PAIRED_PHONE_PATH = SECURITY_DIR / ".cognifinance_paired_phone.json"
 UNLOCK_LOCKOUT_PATH = SECURITY_DIR / ".unlock_lockout.json"
+
+
+# ---------------------------------------------------------------------------
+# Windows owner-only folder permissions (the equivalent of Linux 0o700/0o600)
+# ---------------------------------------------------------------------------
+# On Windows, os.chmod()/os.open() mode bits are ignored (chmod only toggles
+# the read-only flag), so the Linux-style calls below protect nothing there.
+# Windows uses ACLs instead. For each data directory we:
+#   1. grant Full Control to the current user and SYSTEM (inheritable, so
+#      files created inside get the same protection -- the 0o600 equivalent),
+#   2. remove the inherited ACEs (this drops Users/Administrators), and
+#   3. verify we can still write to the directory, rolling back if not.
+# SYSTEM is kept so antivirus/OS services keep working; Administrators can
+# still take ownership, much as root can read anything on Linux.
+# Applied once per directory per user (tracked by a marker in SECURITY_DIR),
+# and never allowed to stop the app from starting.
+_WIN_ACL_MARKER = SECURITY_DIR / ".windows_acl_applied.json"
+_WIN_ACL_VERSION = 1
+_SID_RE = re.compile(r"^S-1-\d+(?:-\d+)+$")
+_SYSTEM_SID = "S-1-5-18"
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _run_windows_tool(args: list):
+    return subprocess.run(
+        args, capture_output=True, text=True, timeout=60, creationflags=_NO_WINDOW
+    )
+
+
+def _current_user_sid() -> str | None:
+    """SID of the account running the app, via `whoami /user`."""
+    r = _run_windows_tool(["whoami", "/user", "/fo", "csv", "/nh"])
+    if r.returncode != 0:
+        return None
+    for row in csv.reader(r.stdout.strip().splitlines()):
+        if len(row) >= 2 and _SID_RE.match(row[1].strip()):
+            return row[1].strip()
+    return None
+
+
+def _can_use_dir(path: Path) -> bool:
+    """True if we can still list and write in the directory."""
+    try:
+        os.listdir(path)
+        with tempfile.TemporaryFile(dir=str(path)):
+            pass
+        return True
+    except OSError:
+        return False
+
+
+def _restrict_dir_to_owner_windows(path: Path, sid: str) -> bool:
+    """Owner(+SYSTEM)-only ACL on one directory. Returns True on success.
+    Grants BEFORE removing inheritance and verifies access afterwards, so a
+    failure can never leave the user locked out of their own data."""
+    grants = [f"*{sid}:(OI)(CI)F", f"*{_SYSTEM_SID}:(OI)(CI)F"]
+    r = _run_windows_tool(["icacls", str(path), "/grant:r", *grants])
+    if r.returncode != 0:
+        logger.warning(f"ACL grant failed for {path}: {r.stderr.strip() or r.stdout.strip()}")
+        return False
+    r = _run_windows_tool(["icacls", str(path), "/inheritance:r"])
+    if r.returncode != 0:
+        logger.warning(f"ACL inheritance removal failed for {path}: {r.stderr.strip() or r.stdout.strip()}")
+        _run_windows_tool(["icacls", str(path), "/inheritance:e"])
+        return False
+    if not _can_use_dir(path):
+        logger.error(f"Owner-only ACL left {path} inaccessible; rolling back.")
+        _run_windows_tool(["icacls", str(path), "/inheritance:e"])
+        return False
+    return True
+
+
+def _read_acl_marker() -> dict:
+    try:
+        with open(_WIN_ACL_MARKER, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _apply_windows_acls(dirs) -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        user = f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}"
+        marker = _read_acl_marker()
+        done = set()
+        if marker.get("version") == _WIN_ACL_VERSION and marker.get("user") == user:
+            done = set(marker.get("dirs", []))
+
+        todo = [d for d in dirs if str(d) not in done]
+        if not todo:
+            return
+        sid = _current_user_sid()
+        if sid is None:
+            logger.warning("Could not determine current user SID; leaving default folder permissions.")
+            return
+        for d in todo:
+            if _restrict_dir_to_owner_windows(d, sid):
+                done.add(str(d))
+        atomic_secure_write_json(
+            _WIN_ACL_MARKER,
+            {"version": _WIN_ACL_VERSION, "user": user, "dirs": sorted(done)},
+        )
+    except Exception as e:
+        # Never block startup; default profile permissions still apply.
+        logger.warning(f"Could not apply Windows folder permissions: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +190,11 @@ def ensure_directories() -> None:
         os.chmod(SECURITY_DIR, 0o700)
     except OSError:
         pass
+
+    # Windows ignores the chmod calls above; apply real ACLs there.
+    _apply_windows_acls(
+        [BUDGET_DIR, BACKUP_DIR, STATE_DIR, TAX_TEMPLATES_DIR, SECURITY_DIR]
+    )
 
 
 # ---------------------------------------------------------------------------

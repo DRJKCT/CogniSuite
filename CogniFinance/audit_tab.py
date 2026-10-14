@@ -3,8 +3,16 @@ Audit log tab for CogniFinance.
 
 Standalone QWidget that uses AuditLogReader for data access. Designed
 to be dropped into the main tab widget with minimal wiring in ui_main.py.
-audit_tab.py ver 0.1
-for CogniFinance ver 1.8
+
+audit_tab.py ver 0.2
+for CogniFinance ver 1.9
+
+Tables here are *display surfaces*: they render state, they never accept
+in-place edits. Mutations in CogniFinance happen via actions (buttons,
+dialogs), not by typing into a cell — see ui_helpers.setup_display_table
+for the contract. This is separate from append-only-ness, which is
+enforced at the ledger layer (sql_transaction_history is insert-only and
+hash-chained).
 """
 from typing import Optional
 
@@ -18,6 +26,25 @@ from PyQt6.QtCore import Qt, QDate
 from PyQt6.QtGui import QColor
 
 from audit import AuditLogReader
+from ui_helpers import (
+    apply_column_layout,
+    set_header_tooltip,
+    setup_display_table,
+)
+
+
+# ---------------------------------------------------------------------------
+# Column layouts — single source of truth per table.
+# ---------------------------------------------------------------------------
+
+_AUDIT_TABLE_HEADERS = ["When", "Type", "Tx Date", "Description", "Reason", "Summary"]
+_HISTORY_DIALOG_HEADERS = ["When", "Type", "Description", "Reason", "Summary"]
+_SINGLE_ENTRY_LINE_HEADERS = ["Account", "Debit", "Credit"]
+
+_REASON_TOOLTIP = (
+    "User-supplied reason recorded when a transaction is edited. "
+    "Empty for 'created' and 'voided' entries."
+)
 
 
 class AuditTab(QWidget):
@@ -75,11 +102,12 @@ class AuditTab(QWidget):
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
-        # Table
+        # Table — display surface, row-selectable (double-click opens detail)
         self.table = QTableWidget()
-        self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["When", "Type", "Tx Date", "Description", "Summary"])
+        apply_column_layout(self.table, _AUDIT_TABLE_HEADERS)
+        setup_display_table(self.table, selection="row")
         self._setup_headers()
+        set_header_tooltip(self.table, _AUDIT_TABLE_HEADERS, "Reason", _REASON_TOOLTIP)
         self.table.doubleClicked.connect(self._show_detail_for_index)
         layout.addWidget(self.table)
 
@@ -96,14 +124,12 @@ class AuditTab(QWidget):
         layout.addLayout(pager)
 
     def _setup_headers(self):
-        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        """Column-sizing configuration on top of the display-surface contract."""
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(True)
         header.setHighlightSections(False)
-        self.table.verticalHeader().setVisible(False)
+        header.setSectionsClickable(True)
 
     # ------------------------------------------------------------------ Filters
     def _filter_params(self):
@@ -153,7 +179,9 @@ class AuditTab(QWidget):
 
             self.table.setItem(row_idx, 2, QTableWidgetItem(entry["date"] or ""))
             self.table.setItem(row_idx, 3, QTableWidgetItem(entry["description"] or ""))
-            self.table.setItem(row_idx, 4, QTableWidgetItem(self._summarize_lines(entry["lines"])))
+            self.table.setItem(row_idx, 4, QTableWidgetItem(entry.get("change_reason") or ""))
+            # Column 5 exists now (six headers), so this lands where it should.
+            self.table.setItem(row_idx, 5, QTableWidgetItem(self._summarize_lines(entry["lines"])))
 
         total_pages = max(1, (self._total + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
         self.page_label.setText(f"Page {self._page + 1} of {total_pages}  ({self._total} entries)")
@@ -197,6 +225,7 @@ class AuditTab(QWidget):
         header.addRow("Changed at:", QLabel(entry["changed_at"] or ""))
         header.addRow("Transaction date:", QLabel(entry["date"] or ""))
         header.addRow("Description:", QLabel(entry["description"] or ""))
+        header.addRow("Change reason:", QLabel(entry.get("change_reason") or "-"))
         layout.addLayout(header)
 
         note = QLabel(
@@ -204,14 +233,21 @@ class AuditTab(QWidget):
             + ("<b>before</b> the edit/deletion."
                if entry["change_type"] in ("updated", "deleted")
                else "as it was first entered.")
+            + " Audit snapshots are read-only."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
 
         lines_table = QTableWidget()
-        lines_table.setColumnCount(3)
-        lines_table.setHorizontalHeaderLabels(["Account", "Debit", "Credit"])
+        apply_column_layout(lines_table, _SINGLE_ENTRY_LINE_HEADERS)
+        # Pure readout: no edit triggers, no editable delegate, no selection.
+        setup_display_table(
+            lines_table,
+            selection="none",
+            alternating_rows=False,
+        )
         lines_table.horizontalHeader().setStretchLastSection(True)
+
         lines_table.setRowCount(len(entry["lines"]))
         for i, line in enumerate(entry["lines"]):
             lines_table.setItem(i, 0, QTableWidgetItem(line.get("account_name", "")))
@@ -231,11 +267,14 @@ class AuditTab(QWidget):
         layout = QVBoxLayout(dlg)
 
         table = QTableWidget()
-        table.setColumnCount(4)
-        table.setHorizontalHeaderLabels(["When", "Type", "Description", "Summary"])
+        apply_column_layout(table, _HISTORY_DIALOG_HEADERS)
+        setup_display_table(table, selection="row")
         table.horizontalHeader().setStretchLastSection(True)
-        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        # Tooltip targets THIS dialog's table, looked up by header name —
+        # previously it was attached to self.table (the wrong table) at a
+        # hard-coded index (column 4 = Summary, not Reason).
+        set_header_tooltip(table, _HISTORY_DIALOG_HEADERS, "Reason", _REASON_TOOLTIP)
+
         table.setRowCount(len(entries))
         for i, entry in enumerate(entries):
             table.setItem(i, 0, QTableWidgetItem(entry["changed_at"] or ""))
@@ -245,7 +284,8 @@ class AuditTab(QWidget):
                 type_item.setForeground(QColor(color))
             table.setItem(i, 1, type_item)
             table.setItem(i, 2, QTableWidgetItem(entry["description"] or ""))
-            table.setItem(i, 3, QTableWidgetItem(self._summarize_lines(entry["lines"])))
+            table.setItem(i, 3, QTableWidgetItem(entry.get("change_reason") or ""))
+            table.setItem(i, 4, QTableWidgetItem(self._summarize_lines(entry["lines"])))
         layout.addWidget(table)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)

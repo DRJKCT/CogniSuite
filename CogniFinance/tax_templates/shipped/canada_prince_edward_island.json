@@ -1,0 +1,44 @@
+{
+  "cognifinance_tax_template": 1,
+  "template_type": "provincial_base",
+  "template_id": "canada_prince_edward_island",
+  "display_name": "Prince Edward Island (2026)",
+  "description": "Prince Edward Island provincial income tax brackets and Basic Personal Amount for the 2026 tax year.",
+  "tax_year": 2026,
+  "provincial_brackets": [
+    {
+      "threshold": 0,
+      "rate": 0.095
+    },
+    {
+      "threshold": 33928,
+      "rate": 0.1347
+    },
+    {
+      "threshold": 65820,
+      "rate": 0.166
+    },
+    {
+      "threshold": 106890,
+      "rate": 0.1762
+    },
+    {
+      "threshold": 142520,
+      "rate": 0.19
+    },
+    {
+      "threshold": 200000,
+      "rate": 0.2
+    }
+  ],
+  "module_compatibility": {},
+  "levies": [],
+  "credits": [
+    {
+      "name": "Prince Edward Island Basic Personal Amount",
+      "type": "rate",
+      "amount": 14650.0,
+      "rate": 0.095
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "cognifinance_tax_template": 4,
+  "template_type": "jurisdiction_base",
+  "template_id": "gb-national-2025",
+  "display_name": {"en": "United Kingdom 2025-26"},
+  "description": {"en": "SIMPLIFIED ILLUSTRATION of UK income tax (with the personal allowance taper) and employee National Insurance. Scottish rates and other reliefs are not modeled. Verify every figure against official sources before relying on it."},
+  "jurisdiction": {"country": "GB", "country_name": {"en": "United Kingdom"}, "level": "national"},
+  "currency": "GBP",
+  "tax_year": 2025,
+  "tax_period": {"label": "2025-26", "start": "2025-04-06", "end": "2026-04-05"},
+  "rounding": {"mode": "down", "increment": "1"},
+  "module_compatibility": {"gb-income-2025": [{"version": 2025, "valid_until": null}]},
+  "adjustments": [
+    {
+      "name": "personal_allowance",
+      "label": {"en": "Personal allowance"},
+      "stage": "deduction",
+      "type": "tapered",
+      "base": 12570,
+      "threshold": 100000,
+      "reduction_rate": 0.5,
+      "floor": 0
+    }
+  ],
+  "brackets": [
+    {"threshold": 0, "rate": 0.20},
+    {"threshold": 37700, "rate": 0.40},
+    {"threshold": 125140, "rate": 0.45}
+  ],
+  "levies": [
+    {
+      "name": "NI",
+      "label": {"en": "National Insurance (employee)"},
+      "type": "banded_rate",
+      "applies_to": ["employment"],
+      "bands": [
+        {"threshold": 12570, "rate": 0.08},
+        {"threshold": 50270, "rate": 0.02}
+      ]
+    }
+  ]
+}
