@@ -1,6 +1,7 @@
 # csv_transaction_import.py
 # For CogniFinance -- generic CSV import for investment/crypto
-# transactions (buy/sell/dividend/transfer).
+# transactions (buy/sell/dividend/reinvested dividend/split/
+# staking-reward-airdrop/transfer).
 #
 # Answers open question #4 from the Investment & Crypto planning brief
 # ("which brokerage/exchange CSV format(s) to target first") with a
@@ -40,6 +41,7 @@
 
 import csv
 import logging
+import re
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import List, Dict, Optional, Callable, Tuple, Any
@@ -52,23 +54,52 @@ from PyQt6.QtWidgets import (
 logger = logging.getLogger(__name__)
 
 # Normalizes a variety of exchange/brokerage action strings to one of
-# our four canonical actions. Extend this, not the callers, when a new
+# our canonical actions. Extend this, not the callers, when a new
 # provider's wording shows up.
+# Deliberately NOT aliased: a bare "reinvestment" / "reinvest". Many
+# brokers export a reinvested dividend as TWO rows -- a dividend
+# received, then a reinvestment purchase. Treating that second row as
+# a "drip" (which itself records the dividend as income) would count
+# the dividend twice. Only labels that unambiguously describe the
+# whole dividend-plus-purchase in ONE row map to "drip"; anything else
+# shows up as an unrecognized action so the user decides.
 DEFAULT_ACTION_ALIASES: Dict[str, str] = {
     "buy": "buy", "bought": "buy", "purchase": "buy",
     "sell": "sell", "sold": "sell", "sale": "sell",
     "dividend": "dividend", "div": "dividend", "distribution": "dividend",
     "transfer in": "transfer_in", "receive": "transfer_in", "deposit": "transfer_in",
     "transfer out": "transfer_out", "send": "transfer_out", "withdrawal": "transfer_out",
+    "drip": "drip", "dividend reinvested": "drip", "dividend reinvestment": "drip",
+    "reinvested dividend": "drip", "reinvest dividend": "drip",
+    "split": "split", "stock split": "split", "forward split": "split", "reverse split": "split",
+    "staking": "staking", "staking reward": "staking", "staking income": "staking",
+    "reward": "reward", "rewards": "reward",
+    "airdrop": "airdrop",
 }
 
-CANONICAL_ACTIONS = ("buy", "sell", "dividend", "transfer_in", "transfer_out")
+CANONICAL_ACTIONS = (
+    "buy", "sell", "dividend", "transfer_in", "transfer_out",
+    "drip", "split", "staking", "reward", "airdrop",
+)
+
+# Posting order within a single date (lower first). A split must land
+# before any sale on its date, because the engine refuses a split once
+# a sale on/after its date exists; a buy must land before a sale so
+# there is a lot to sell. Everything else is order-insensitive.
+_SAME_DAY_ORDER = {"split": 0, "sell": 2, "transfer_out": 2}
 
 
 class CSVImportError(ValueError):
     """Structural problem with the file itself -- unreadable, or
     missing a column the mapping says to expect. Distinct from a
     single bad row, which is skipped rather than raised."""
+    amount_col: Optional[str] = None
+    fee_col: Optional[str] = None
+    action_aliases: Dict[str, str] = field(default_factory=lambda: dict(DEFAULT_ACTION_ALIASES))
+    # Only used by "split" rows: one column holding the ratio as
+    # "2:1", "2-for-1", "2/1" or a bare "2" (meaning 2-for-1). Placed
+    # last so existing keyword/positional construction is unaffected.
+    ratio_col: Optional[str] = None
 
 
 @dataclass
@@ -100,6 +131,11 @@ class ParsedTransactionRow:
     price: Optional[Decimal]
     fee: Decimal
     raw: Dict[str, str]  # original row, kept for error messages / audit trail
+    # Added for drip/split rows; all default to None so older callers
+    # and tests constructing rows by hand are unaffected.
+    amount: Optional[Decimal] = None  # drip: total dividend reinvested; other rows: raw amount column if mapped
+    split_new: Optional[Decimal] = None  # split only: new shares ...
+    split_old: Optional[Decimal] = None  # ... for this many old shares
 
 
 @dataclass
@@ -141,6 +177,41 @@ def _decimal_or_none(raw: Optional[str]) -> Optional[Decimal]:
     except InvalidOperation:
         return None
 
+_SPLIT_RATIO_RE = re.compile(
+    r"^\s*(\d+(?:\.\d+)?)\s*(?:[:/]|-?for-?)\s*(\d+(?:\.\d+)?)\s*$", re.IGNORECASE
+)
+_BARE_NUMBER_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*$")
+
+
+def parse_split_ratio(raw: Optional[str]) -> Optional[Tuple[Decimal, Decimal]]:
+    """Parse a split ratio into (new_shares, old_shares). Accepts
+    "2:1", "2/1", "2-for-1", "2 for 1", and a bare "2" (= 2-for-1);
+    a 1-for-10 reverse split is "1:10" / "1-for-10". Returns None for
+    anything else, including a zero side or a 1:1 ratio. A hyphen
+    between bare numbers ("2-1") is deliberately NOT accepted -- it is
+    indistinguishable from a date fragment."""
+    if raw is None:
+        return None
+    m = _SPLIT_RATIO_RE.match(raw)
+    if m:
+        new, old = Decimal(m.group(1)), Decimal(m.group(2))
+    else:
+        m = _BARE_NUMBER_RE.match(raw)
+        if not m:
+            return None
+        new, old = Decimal(m.group(1)), Decimal(1)
+    if new <= 0 or old <= 0 or new == old:
+        return None
+    return new, old
+
+
+def order_rows_for_posting(rows: List[ParsedTransactionRow]) -> List[ParsedTransactionRow]:
+    """Chronological order, regardless of how the file was sorted
+    (many exports are newest-first). Within one date: splits first,
+    then buys/receipts/income, then sells/transfers-out; otherwise
+    file order. Posting a sale before the purchase it consumes, or a
+    split after a later sale, fails or silently mis-matches lots."""
+    return sorted(rows, key=lambda r: (r.date, _SAME_DAY_ORDER.get(r.action, 1), r.row_number))
 
 def parse_transaction_csv(path: str, mapping: ColumnMapping) -> ParseResult:
     """Pure parse: no engine, no DB, no side effects. Raises
@@ -184,10 +255,10 @@ def parse_transaction_csv(path: str, mapping: ColumnMapping) -> ParseResult:
                 fee = _decimal_or_none(row.get(mapping.fee_col)) if mapping.fee_col else None
                 fee = fee if fee is not None else Decimal("0.00")
 
-                if price is None and mapping.amount_col and quantity:
-                    amount = _decimal_or_none(row.get(mapping.amount_col))
-                    if amount is not None and quantity != 0:
-                        price = amount / quantity
+                raw_amount = _decimal_or_none(row.get(mapping.amount_col)) if mapping.amount_col else None
+                if price is None and raw_amount is not None and quantity:
+                    if quantity != 0:
+                        price = raw_amount / quantity
 
                 if action in ("buy", "sell") and (quantity is None or price is None):
                     skipped.append((i, f"'{action}' requires quantity and price/amount; got quantity={quantity}, price={price}"))
@@ -200,9 +271,54 @@ def parse_transaction_csv(path: str, mapping: ColumnMapping) -> ParseResult:
                     skipped.append((i, "'dividend' requires an amount (via price_col or amount_col)"))
                     continue
 
+                row_amount = raw_amount
+                split_new = split_old = None
+
+                if action == "drip":
+                    # One-row reinvested dividend: income AND a new lot.
+                    # Prefer the broker-reported total (sign-insensitive:
+                    # exports often show the reinvestment as a negative
+                    # cash movement); fall back to per-unit price x qty.
+                    if quantity is None or quantity <= 0:
+                        skipped.append((i, "'drip' requires a positive quantity (shares received)"))
+                        continue
+                    if raw_amount is not None:
+                        row_amount = abs(raw_amount)
+                    elif price is not None:
+                        row_amount = price * quantity
+                    else:
+                        skipped.append((i, "'drip' requires a dividend amount (amount_col) or a per-unit price"))
+                        continue
+                    if row_amount <= 0:
+                        skipped.append((i, "'drip' amount must be positive"))
+                        continue
+
+                if action in ("staking", "reward", "airdrop"):
+                    # Income at fair market value on receipt; that value
+                    # is also the new lot's cost basis, so a missing or
+                    # zero price must NOT silently become a zero basis.
+                    if quantity is None or quantity <= 0 or price is None or price <= 0:
+                        skipped.append((i, (
+                            f"'{action}' requires a positive quantity and a positive fair-market "
+                            f"price/amount; got quantity={quantity}, price={price}"
+                        )))
+                        continue
+
+                if action == "split":
+                    if not mapping.ratio_col:
+                        skipped.append((i, "'split' rows need a split-ratio column; map one, or use the Stock Split form"))
+                        continue
+                    ratio_text = row.get(mapping.ratio_col)
+                    ratio = parse_split_ratio(ratio_text)
+                    if ratio is None:
+                        skipped.append((i, f"unparseable split ratio '{ratio_text}' (expected e.g. 2:1, 2-for-1, 1:10)"))
+                        continue
+                    split_new, split_old = ratio
+
                 rows.append(ParsedTransactionRow(
                     row_number=i, date=date_str, symbol=symbol, action=action,
                     quantity=quantity, price=price, fee=fee, raw=dict(row),
+                    amount=row_amount, split_new=split_new, split_old=split_old,
                 ))
     except FileNotFoundError:
         raise CSVImportError(f"File not found: '{path}'")
@@ -243,7 +359,7 @@ class CSVColumnMappingDialog(QDialog):
         layout.addWidget(QLabel(f"Detected header row:\n{header_line}"))
         layout.addWidget(QLabel(
             "Enter the exact column names from your file for each field below. "
-            "Leave Quantity/Price/Amount/Fee blank if your file doesn't have that column."
+            "Leave Quantity/Price/Amount/Fee/Split ratio blank if your file doesn't have that column."
         ))
 
         form = QFormLayout()
@@ -254,6 +370,7 @@ class CSVColumnMappingDialog(QDialog):
         self.price_col = QLineEdit("Price")
         self.amount_col = QLineEdit("")
         self.fee_col = QLineEdit("Fee")
+        self.ratio_col = QLineEdit("")
         form.addRow("Date column:", self.date_col)
         form.addRow("Symbol column:", self.symbol_col)
         form.addRow("Action/Type column:", self.action_col)
@@ -261,6 +378,7 @@ class CSVColumnMappingDialog(QDialog):
         form.addRow("Price/unit column:", self.price_col)
         form.addRow("Total amount column (if no per-unit price):", self.amount_col)
         form.addRow("Fee column:", self.fee_col)
+        form.addRow("Split ratio column (splits only, e.g. 2:1):", self.ratio_col)
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -278,6 +396,7 @@ class CSVColumnMappingDialog(QDialog):
             price_col=self.price_col.text().strip() or None,
             amount_col=self.amount_col.text().strip() or None,
             fee_col=self.fee_col.text().strip() or None,
+            ratio_col=self.ratio_col.text().strip() or None,
         )
         # Fail fast on a structurally bad mapping (missing required
         # column) rather than letting the background thread discover
@@ -333,9 +452,11 @@ class TransactionCSVImportThread(QThread):
             skipped_details = [f"Row {n}: {reason}" for n, reason in result.skipped]
             errors: List[str] = []
             imported = 0
-            total = len(result.rows)
+            # Post in chronological order whatever order the file is in.
+            ordered_rows = order_rows_for_posting(result.rows)
+            total = len(ordered_rows)
 
-            for j, row in enumerate(result.rows):
+            for j, row in enumerate(ordered_rows):
                 pct = int(((j + 1) / total) * 100) if total else 100
                 self.progress_signal.emit(pct, f"Row {row.row_number}: {row.action} {row.symbol}")
                 try:

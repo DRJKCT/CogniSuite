@@ -8,6 +8,7 @@ import time
 import logging
 import traceback
 from typing import Optional
+from PyQt6.QtGui import QGuiApplication
 from crypto_envelope import (
     load_envelope, create_new_envelope, unlock_with_primary,
     unlock_with_recovery, change_primary_passphrase, ENVELOPE_PATH
@@ -48,7 +49,7 @@ from config import atomic_secure_write_json
 
 from config import (
     ensure_directories, BUDGET_DIR, DB_PATH,
-    UNLOCK_LOCKOUT_PATH, SECURITY_DIR,
+    UNLOCK_LOCKOUT_PATH, SECURITY_DIR, UI_CONFIG_PATH,
 )
 
 from qt_material import apply_stylesheet
@@ -452,6 +453,12 @@ def main():
 
     app = QApplication(sys.argv)
 
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("cognifinance.cognifinance.1")
+    except Exception:
+        pass
+
     #setup stylesheet
     apply_stylesheet(app, theme='light_teal_500.xml')
 
@@ -532,14 +539,50 @@ def main():
                 passphrase_to_cache = dialog.passphrase if save_to_keyring else None
 
     # =========================================================================
-    # Launch App
+    # COMPUTE WINDOW SIZE FROM SCREEN LOGICAL GEOMETRY
     # =========================================================================
+
+    # Pick the primary screen
+    primary_screen = QGuiApplication.primaryScreen()
+    geometry = primary_screen.availableGeometry()  # logical pixels, excludes taskbar
+
+    # Default: 85% of available logical area
+    frac = 0.85
+    win_w = int(geometry.width() * frac)
+    win_h = int(geometry.height() * frac)
+
+    # Clamp minimum so the UI never breaks on tiny screens
+    win_w = max(win_w, 960)
+    win_h = max(win_h, 600)
+
+    # Cap maximum to avoid absurdly wide windows on ultrawide monitors
+    win_w = min(win_w, 2200)
+    win_h = min(win_h, 1400)
+
+    # Try to load last saved geometry for continuity across restarts.
+    ui_config_path = os.path.join(DB_DIR, "ui_config.json")
+    last_w, last_h = None, None
+    try:
+        if os.path.exists(ui_config_path):
+            with open(ui_config_path, "r") as f:
+                cfg = json.load(f)
+            last_w = cfg.get("window_width")
+            last_h = cfg.get("window_height")
+    except Exception:
+        pass
+
+    if last_w and last_h:
+        # Use saved size, but clamp to availableGeometry so the window
+        # never exceeds the current monitor's bounds (e.g. user was on
+        # a larger dual-monitor setup and moved to a laptop).
+        win_w = max(min(last_w, geometry.width()), 960)
+        win_h = max(min(last_h, geometry.height()), 600)
 
     if not dek_hex:
         sys.exit(1)
 
     try:
-        win = BudgetApp(DB_PATH, dek_hex)
+        win = BudgetApp(DB_PATH, dek_hex, target_width=win_w, target_height=win_h)
         dek_hex = "" # Clear from memory
 
         if save_to_keyring and keyring is not None and passphrase_to_cache:
@@ -557,6 +600,20 @@ def main():
     except Exception as e:
         QMessageBox.critical(None, "Startup failed", f"Could not open the database:\n{e}")
         sys.exit(1)
+
+    win.layout().activate()
+
+    screen = QGuiApplication.primaryScreen().availableGeometry()
+
+    # Never open bigger than the screen, regardless of the layout's minimum.
+    # Also nudge Qt's minimum down so the user can actually shrink it later.
+    max_w = screen.width()
+    max_h = screen.height()
+
+    if win_w > max_w: win_w = max_w
+    if win_h > max_h: win_h = max_h
+
+    win.resize(win_w, win_h)
 
     win.show()
     sys.exit(app.exec())

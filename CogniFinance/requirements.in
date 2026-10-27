@@ -1,12 +1,17 @@
 # requirements.in
 PyQt6>=6.5
 cryptography>=41.0
-sqlcipher3-binary
+sqlcipher3==0.6.2
 openpyxl
 pdfplumber
 ofxparse
 qrcode
 spake2
 qt-material
-netifaces
+netifaces2
+matplotlib
 maturin
+reportlab
+pytest
+pytest-timeout
+pandas

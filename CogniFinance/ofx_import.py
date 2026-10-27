@@ -4,6 +4,7 @@ from decimal import Decimal
 from typing import List, Tuple, Dict, Any, Optional
 from ofxparse import OfxParser
 from reconciliation_matcher import extract_suggested_matches
+from merchant_normalization import normalize_merchant
 from PyQt6.QtCore import QThread, pyqtSignal
 
 logger = logging.getLogger(__name__)
@@ -166,11 +167,21 @@ def import_ofx_transactions(
                 lines_data.append((category, abs_amount, Decimal("0.00")))
                 lines_data.append((target_account_name, Decimal("0.00"), abs_amount))
 
+        merchant_key, merchant_display = normalize_merchant(description)
+        category_suggested = None
+        if merchant_key:
+            suggestion = ledger.get_best_suggestion_for_merchant(merchant_key)
+            if suggestion:
+                category_suggested = suggestion["category"]
+
         transactions_to_import.append({
             "date": date_str,
             "description": description,
             "lines": lines_data,
-            "imported_id": fitid
+            "imported_id": fitid,
+            "merchant_key": merchant_key,
+            "merchant_display": merchant_display,
+            "category_suggested": category_suggested,
         })
 
     ending_bal = getattr(statement, 'balance', None)
@@ -192,6 +203,59 @@ def import_ofx_transactions(
             )
 
     return transactions_to_import
+
+def record_merchant_learning_for_last_transaction(ledger, description: str, merchant_key: str = None,
+                                                   merchant_display: str = None, category_suggested=None,
+                                                   category_line_index: int = 0) -> None:
+    """
+    Best-effort: stage a merchant_draft for the category leg of the
+    transaction that was JUST posted via ledger.record_transaction().
+    Must be called immediately after a successful, non-batched post --
+    see GeneralLedger.get_last_transaction() for why.
+
+    merchant_key/merchant_display/category_suggested are optional: if not
+    supplied (e.g. by a caller that doesn't have them precomputed, such
+    as a rejected-match repost whose dict shape isn't guaranteed to carry
+    them), they're derived here from `description` alone -- normalize_merchant
+    is a pure function of the description string, so recomputing it is
+    always safe and always gives the same answer.
+
+    category_line_index assumes the double-entry convention used
+    throughout this codebase's importers: the category/expense leg is
+    lines_data[0], the bank/asset leg is lines_data[1]. If a future
+    importer builds lines in the other order, pass the correct index.
+
+    Never raises: merchant learning is a passive side channel and must
+    never be able to fail an import that otherwise succeeded.
+    """
+    try:
+        tx = ledger.get_last_transaction()
+        if tx is None or not tx.lines or category_line_index >= len(tx.lines):
+            return
+        line = tx.lines[category_line_index]
+        if line.id is None:
+            return
+
+        if merchant_key is None:
+            merchant_key, merchant_display = normalize_merchant(description)
+        if not merchant_key:
+            return
+
+        if category_suggested is None:
+            suggestion = ledger.get_best_suggestion_for_merchant(merchant_key)
+            category_suggested = suggestion["category"] if suggestion else None
+
+        ledger.record_merchant_draft(
+            tx_id=tx.id,
+            line_id=line.id,
+            raw_string=description,
+            merchant_key=merchant_key,
+            merchant_display=merchant_display,
+            category_suggested=category_suggested,
+        )
+    except Exception:
+        logger.exception("Merchant learning: failed to stage draft (non-fatal)")
+
 
 class OFXImportThread(QThread):
     """Runs the heavy OFX parsing and DB insertion in a background thread."""
@@ -245,6 +309,13 @@ class OFXImportThread(QThread):
                         )
                         if ok:
                             total_imported += 1
+                            record_merchant_learning_for_last_transaction(
+                                self.gl,
+                                tx["description"],
+                                merchant_key=tx.get("merchant_key"),
+                                merchant_display=tx.get("merchant_display"),
+                                category_suggested=tx.get("category_suggested"),
+                            )
                         else:
                             logger.warning(f"OFX Import: Ledger rejected '{tx['description']}': {msg}")
                             total_skipped += 1

@@ -12,14 +12,15 @@
 # engines are lot_matcher.py (pure FIFO/specific-lot math) and posting
 # through gl.record_transaction() like everything else.
 #
-# v1 scope (deliberately minimal -- see open question #1 in the
-# planning brief, resolved here for v1 so building could start):
-#   - Buy, sell, transfer between wallets. That's it.
-#   - Staking/reward/airdrop income is NOT handled in v1. It needs a
-#     distinct "income at fair-market-value on receipt, which becomes
-#     that unit's cost basis" code path with no analog in plain
-#     buy/sell -- see record_staking_reward() below, a deliberate stub
-#     rather than a silent gap.
+# v1 scope (see open question #1 in the planning brief):
+#   - Buy, sell, transfer between wallets.
+#   - Staking/reward/airdrop income via record_staking_reward(): income
+#     at fair-market-value on receipt, which becomes the new lot's
+#     cost basis. The caller supplies the FMV; this engine never looks
+#     one up itself.
+#   - NOT handled: a stake/unstake operation (the "Crypto — Staked"
+#     report line only classifies a holding), LP/yield positions, and
+#     zero-value receipts.
 #
 # Zero jurisdiction knowledge here either -- same reasoning as
 # investment_engine.py. Per-wallet lot tracking in v1 is a deliberate
@@ -39,10 +40,17 @@ logger = logging.getLogger(__name__)
 
 ZERO = Decimal("0.00")
 
-REALIZED_GAINS_ACCOUNT = "Realized Gains — Crypto"
 REALIZED_GAINS_REPORT_LINE = "Crypto — Realized Gains"
 REALIZED_LOSSES_ACCOUNT = "Realized Losses — Crypto"
 REALIZED_LOSSES_REPORT_LINE = "Crypto — Realized Losses"
+REALIZED_GAINS_ACCOUNT = "Realized Gains — Crypto"
+STAKING_INCOME_ACCOUNT = "Staking Income — Crypto"
+STAKING_INCOME_REPORT_LINE = "Crypto — Staking Income"
+
+# Staking, protocol rewards and airdrops all post to the one income
+# account (the report line is the template layer's grouping handle);
+# `kind` only labels the ledger description.
+VALID_REWARD_KINDS = ("staking", "reward", "airdrop")
 
 VALID_COST_BASIS_METHODS = ("FIFO", "SPECIFIC")
 
@@ -160,6 +168,7 @@ class CryptoEngine:
         for name, acc_type, report_line in (
             (REALIZED_GAINS_ACCOUNT, "Revenue", REALIZED_GAINS_REPORT_LINE),
             (REALIZED_LOSSES_ACCOUNT, "Expense", REALIZED_LOSSES_REPORT_LINE),
+            (STAKING_INCOME_ACCOUNT, "Revenue", STAKING_INCOME_REPORT_LINE),
         ):
             if name not in self.gl.accounts:
                 ok, msg = self.gl.create_account(name, acc_type, report_line)
@@ -580,7 +589,7 @@ class CryptoEngine:
             conn.close()
 
     def void_last_transaction(self, asset: str, wallet_name: str) -> Tuple[bool, str]:
-        """Reverses the most recent not-yet-undone buy/sell for this
+        """Reverses the most recent not-yet-undone buy/sell/reward for this
         (asset, wallet) holding, strictly in LIFO order -- see
         InvestmentEngine.void_last_transaction() for the full rationale,
         including why this posts a plain offsetting entry via
@@ -667,16 +676,77 @@ class CryptoEngine:
         finally:
             conn.close()
 
-    def record_staking_reward(self, *args, **kwargs):
-        """Staking/reward/airdrop income is explicitly out of v1 scope
-        -- see the planning brief's open question #1. It needs its own
-        'income at fair-market-value on receipt, which becomes cost
-        basis' code path; this stub exists so that's a deliberate
-        decision made here, not a silent gap discovered later."""
-        raise NotImplementedError(
-            "Staking/reward/airdrop income is not implemented in v1. See the "
-            "Investment & Crypto planning brief, open question #1, before adding this."
+    def record_staking_reward(self, asset: str, wallet_name: str, date: str, quantity: Decimal,
+                               fmv_per_unit: Decimal, kind: str = "staking",
+                               description: Optional[str] = None) -> Tuple[bool, str]:
+        """Record crypto received as a reward (staking, protocol
+        reward, airdrop) into an existing (asset, wallet) holding.
+
+        Most jurisdictions that tax crypto treat this as ordinary
+        income at fair market value on the date received, and that
+        same value becomes the cost basis of the received units for
+        any later disposal. So this posts income AND opens a lot:
+            Dr <holding account>   income
+            Cr Staking Income      income
+        and adds a lot dated `date` with cost basis per unit =
+        income / quantity. No cash account is involved.
+
+        `fmv_per_unit` is supplied by the caller (typed in, or taken
+        from imported price history) -- this engine does no lookups.
+        Income is rounded to cents FIRST, and the lot's per-unit
+        basis is derived from that rounded figure, so the ledger and
+        the lot table always agree to the cent.
+
+        Not supported in v1: zero-value receipts (a worthless airdrop
+        has no income to post and no ledger entry to hang an undo
+        on), and any jurisdiction-specific treatment -- that is the
+        tax template layer's job, same as for every other action.
+        """
+        if kind not in VALID_REWARD_KINDS:
+            return False, f"kind must be one of {VALID_REWARD_KINDS}."
+        holding = self.get_holding(asset, wallet_name)
+        if holding is None:
+            return False, f"Unknown holding '{asset}' in wallet '{wallet_name}'. Call add_holding() first."
+        if quantity <= ZERO:
+            return False, "Quantity must be positive."
+        if fmv_per_unit <= ZERO:
+            return False, (
+                "Fair market value per unit must be positive. Zero-value receipts "
+                "aren't supported in v1."
+            )
+
+        income = (quantity * fmv_per_unit).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if income <= ZERO:
+            return False, "The received amount is worth less than one cent at that price; nothing to record."
+        desc = description or f"{kind.capitalize()} received: {quantity} {asset} ({wallet_name}) @ {fmv_per_unit}"
+
+        ok, msg = self.gl.record_transaction(
+            date, desc,
+            [(holding.account_name, income, ZERO), (STAKING_INCOME_ACCOUNT, ZERO, income)],
         )
+        if not ok:
+            return False, msg
+
+        tx = self.gl.get_last_transaction()
+        cost_basis_per_unit = income / quantity
+
+        conn, cur = self.gl._connect()
+        try:
+            lots_before = self._open_lots(cur, holding.id)
+            self._log_undo_snapshot(cur, holding.id, tx.id if tx else None, "reward", lots_before)
+            cur.execute(
+                "INSERT INTO sql_crypto_lots (holding_id, date_acquired, quantity, cost_basis_per_unit, acquiring_tx_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (holding.id, date, str(quantity), str(cost_basis_per_unit), tx.id if tx else None),
+            )
+            conn.commit()
+            return True, f"Recorded {kind} of {quantity} {asset} into '{wallet_name}' (income {income})."
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"CryptoEngine: ledger posted {kind} for '{asset}' but lot insert failed: {e}")
+            return False, f"Ledger entry posted but lot tracking failed: {e}"
+        finally:
+            conn.close()
 
     # ---------------------------------------------------------------
     # Reporting

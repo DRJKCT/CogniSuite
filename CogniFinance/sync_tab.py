@@ -236,6 +236,7 @@ class SyncTab(QWidget):
         result = self._sync_request("/api/status")
         if result is None:
             if self.sync_thread is not None and not self.sync_thread.is_alive():
+                self._append_sync_log("Sync completed successfully. Server shutting down.")
                 self._stop_mobile_sync_internal(from_server=True)
             return
 
@@ -313,18 +314,24 @@ class SyncTab(QWidget):
         if server is None and not from_server:
             return
 
-        if self.sync_timeout_timer is not None:
-            self.sync_timeout_timer.stop()
-            self.sync_timeout_timer = None
-        if self.sync_status_timer is not None:
-            self.sync_status_timer.stop()
-            self.sync_status_timer.deleteLater()
-            self.sync_status_timer = None
+        for attr in ("sync_timeout_timer", "sync_status_timer"):
+            timer = getattr(self, attr, None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                    timer.deleteLater()
+                except RuntimeError:
+                    # "wrapped C++ object is deleted" — Qt tore it down before
+                    # us. Nothing left to stop.
+                    pass
+                finally:
+                    setattr(self, attr, None)
 
         if server:
             try:
                 server.sync_context.request_shutdown()
-                server.shutdown()
+                if self.sync_thread is not None and self.sync_thread.is_alive():
+                    server.shutdown()
                 server.server_close()
             except Exception as e:
                 if not from_server:

@@ -31,9 +31,13 @@ class TestRunnerManager(QObject):
         self.supply_chain_auditor = None
         self.weekly_checker = None
         self.deep_checker = None
+        self._shutting_down = False
 
     def start_scheduled_audit(self):
         """Initial entry point triggered after app startup."""
+        if self._shutting_down:
+            return
+
         self.log_output.emit("=" * 50)
         self.log_output.emit("AUDIT SCHEDULER: Evaluating cooldowns...")
 
@@ -59,36 +63,44 @@ class TestRunnerManager(QObject):
             self._run_weekly_tests(run_deep_after=False)
 
     def _run_supply_chain_audit(self, run_weekly_after: bool):
+        if self._shutting_down:
+            return
+
         self.log_output.emit("Step 0: Running Supply Chain Vulnerability Audit...")
         self.supply_chain_auditor = SupplyChainAuditor(self.requirements_path)
         self.supply_chain_auditor.log_output.connect(self.log_output.emit)
 
         # Connect to a new handler that decides what to do next
         self.supply_chain_auditor.audit_finished.connect(
-            lambda total, crit, details: self._on_supply_chain_finished(total, crit, details, run_weekly_after, run_deep_after)
+            lambda total, crit, details: self._on_supply_chain_finished(total, crit, details, run_weekly_after)
         )
         self.supply_chain_auditor.start()
 
-    def _on_supply_chain_finished(self, total_vulns: int, critical_vulns: int, details: list, run_weekly: bool, run_deep: bool):
+    def _on_supply_chain_finished(self, total_vulns: int, critical_vulns: int, details: list, run_weekly: bool):
+        if self._shutting_down:
+            return
+
         if total_vulns == -1:
             self.log_output.emit("⚠️ Supply chain audit skipped or failed (offline?). Proceeding to code audits.")
         elif total_vulns > 0:
             self.log_output.emit(f"⚠️ WARNING: {total_vulns} vulnerable dependencies found. Please update requirements.txt.")
-            # Emit signal so ui_main.py can push this to the NotificationCenter
             self.supply_chain_warning.emit(total_vulns, critical_vulns, details)
         else:
             self.log_output.emit("✅ Supply chain is clean.")
 
-        # Proceed to the rest of the audit sequence
+        # Supply chain only ever runs when deep is due (start_scheduled_audit
+        # gates it that way), so the next step is always weekly-then-deep or
+        # straight to deep -- no run_deep parameter needed here.
         if run_weekly:
-            self._run_weekly_tests(run_deep_after=run_deep)
-        elif run_deep:
-            self._run_deep_audit()
+            self._run_weekly_tests(run_deep_after=True)
         else:
-            self.audit_completed.emit(True, "No code audits currently due.")
+            self._run_deep_audit()
 
     def _run_weekly_tests(self, run_deep_after: bool):
         """Step 1: Launch weekly ledger invariant test."""
+        if self._shutting_down:
+            return
+
         self.log_output.emit("Starting Weekly Ledger Invariants...")
         self.weekly_checker = IntegrityChecker(self.test_dir)
         self.weekly_checker.log_output.connect(self.log_output.emit)
@@ -101,6 +113,9 @@ class TestRunnerManager(QObject):
         self.weekly_checker.start()
 
     def _on_weekly_finished_only(self, exit_code: int, summary: str):
+        if self._shutting_down:
+            return
+
         if exit_code == 0:
             save_cooldown_timestamp(self.db_dir)
             self.audit_completed.emit(True, "Weekly audit passed.")
@@ -108,6 +123,9 @@ class TestRunnerManager(QObject):
             self.audit_completed.emit(False, f"Weekly audit failed: {summary}")
 
     def _on_weekly_finished_then_deep(self, exit_code: int, summary: str):
+        if self._shutting_down:
+            return
+
         if exit_code == 0:
             save_cooldown_timestamp(self.db_dir)
             self.log_output.emit("✅ Weekly audit passed. Transitioning to Deep audit...")
@@ -118,6 +136,9 @@ class TestRunnerManager(QObject):
 
     def _run_deep_audit(self):
         """Step 2: Launch deep structural/crypto test suite."""
+        if self._shutting_down:
+            return
+
         self.log_output.emit("Starting Deep Structural/Security Suite...")
         self.deep_checker = DeepIntegrityChecker(self.test_dir,  self.db_dir, self.dek_hex)
         self.deep_checker.log_output.connect(self.log_output.emit)
@@ -153,6 +174,9 @@ class TestRunnerManager(QObject):
 
     def _on_deep_audit_finished(self, exit_code: int, summary: str):
         """Step 3: Finalize deep audit based on exact exit code."""
+        if self._shutting_down:
+            return
+
         # SCENARIO A: Tests ran to completion (Exit 0 = pass, Exit 1 = test failure)
         if exit_code in (0, 1):
             self._update_deep_audit_timestamp()
@@ -204,10 +228,27 @@ class TestRunnerManager(QObject):
 
     def cleanup(self):
         """Ensures subprocesses don't orphan if the app closes mid-test."""
-        processes_to_check = [self.weekly_checker, self.deep_checker, self.supply_chain_auditor]
+        # Order matters: flag and signal-blocking come BEFORE any terminate()/kill(),
+        # because waitForFinished() can emit finished synchronously.
+        self._shutting_down = True
 
-        for checker in (self.weekly_checker, self.deep_checker):
-            if checker and hasattr(checker, 'process') and checker.process.state() != QProcess.ProcessState.NotRunning:
-                checker.process.terminate()
-                if not checker.process.waitForFinished(2000):
-                    checker.process.kill()
+        objs = (self.weekly_checker, self.deep_checker, self.supply_chain_auditor)
+        for obj in objs:
+            if obj is not None:
+                try:
+                    obj.blockSignals(True)
+                except RuntimeError:
+                    pass  # C++ object already deleted
+
+        for obj in objs:
+            proc = getattr(obj, 'process', None)
+            if proc is None:
+                continue
+            try:
+                if proc.state() != QProcess.ProcessState.NotRunning:
+                    proc.terminate()
+                    if not proc.waitForFinished(2000):
+                        proc.kill()
+                        proc.waitForFinished(1000)
+            except RuntimeError:
+                pass

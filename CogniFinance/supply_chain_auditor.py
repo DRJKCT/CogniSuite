@@ -22,18 +22,30 @@ class SupplyChainAuditor(QObject):
         super().__init__(parent)
         self.requirements_path = requirements_path
         self.process = QProcess(self)
-        self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        # Keep stderr separate: warnings/retries on stderr would otherwise be
+        # mixed into stdout and break JSON parsing.
+        self.process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
         self.process.readyReadStandardOutput.connect(self._read_output)
+        self.process.readyReadStandardError.connect(self._read_error)
         self.process.finished.connect(self._on_finished)
+        self.process.errorOccurred.connect(self._on_error)
 
-        # Buffer to hold the JSON output
+        # Buffers: stdout holds the JSON, stderr is kept for diagnostics only
         self._output_buffer = ""
+        self._error_buffer = ""
+        self._done = False  # ensures audit_finished is emitted exactly once
+
+    def _emit_finished(self, total: int, critical: int, details: list):
+        if self._done:
+            return
+        self._done = True
+        self.audit_finished.emit(total, critical, details)
 
     def start(self):
         """Spawns pip-audit in a separate OS process."""
         if not os.path.exists(self.requirements_path):
             self.log_output.emit(f"Supply Chain Audit skipped: {self.requirements_path} not found.")
-            self.audit_finished.emit(0, 0, [])
+            self._emit_finished(0, 0, [])
             return
 
         self.log_output.emit("Starting Supply Chain Vulnerability Audit (pip-audit)...")
@@ -58,41 +70,75 @@ class SupplyChainAuditor(QObject):
         raw_data = self.process.readAllStandardOutput().data().decode('utf-8', errors='replace')
         self._output_buffer += raw_data
 
+    def _read_error(self):
+        raw_data = self.process.readAllStandardError().data().decode('utf-8', errors='replace')
+        self._error_buffer += raw_data
+
+    def _on_error(self, error: QProcess.ProcessError):
+        # If the process can't launch at all, `finished` never fires. Without this
+        # the audit chain would hang and the weekly/deep audits would never start.
+        if error == QProcess.ProcessError.FailedToStart:
+            self.log_output.emit(
+                f"⚠️ Supply Chain Audit could not start ({self.process.errorString()})."
+            )
+            self._emit_finished(-1, 0, [])
+        # Crashed is handled by _on_finished (CrashExit); other errors are
+        # reported through finished or are non-fatal.
+
+    @staticmethod
+    def _flatten_results(results) -> list:
+        """Normalizes pip-audit JSON into a flat list of one dict per vulnerability.
+
+        Newer pip-audit emits {"dependencies": [{"name", "version", "vulns": [...]}]}.
+        Older versions emit a bare list of vulnerability dicts.
+        """
+        if isinstance(results, dict):
+            flat = []
+            for dep in results.get("dependencies", []) or []:
+                for vuln in dep.get("vulns", []) or []:
+                    entry = dict(vuln)
+                    entry["name"] = dep.get("name")
+                    entry["version"] = dep.get("version")
+                    flat.append(entry)
+            return flat
+        if isinstance(results, list):
+            return [v for v in results if isinstance(v, dict)]
+        raise ValueError("Unrecognized pip-audit output shape")
+
     def _on_finished(self, exit_code: int, exit_status: QProcess.ExitStatus):
+        # Drain anything still buffered in the process pipes.
+        self._read_output()
+        self._read_error()
+
         if exit_status == QProcess.ExitStatus.CrashExit:
             self.log_output.emit("❌ Supply Chain Audit process crashed.")
-            self.audit_finished.emit(-1, 0, [])
+            self._emit_finished(-1, 0, [])
             return
 
         # pip-audit exits with 1 if vulnerabilities are found, 0 if clean.
-        # We don't treat exit code 1 as a process failure.
-
-        vuln_count = 0
-        critical_count = 0
-        vulnerabilities = []
-
+        # We don't treat exit code 1 as a process failure; parsing decides.
         try:
-            # pip-audit JSON output is a list of dictionaries
             results = json.loads(self._output_buffer)
-            if isinstance(results, list):
-                vulnerabilities = results
-                vuln_count = len(vulnerabilities)
-
-                # Count critical/high severity
-                for v in vulnerabilities:
-                    # pip-audit uses 'fix_versions' and 'description'
-                    # We'll count anything that doesn't have an immediate fix as critical
-                    if not v.get('fix_versions'):
-                        critical_count += 1
-
-                self.log_output.emit(f"✅ Supply Chain Audit complete. Found {vuln_count} known vulnerabilities.")
-            else:
-                self.log_output.emit("✅ Supply Chain Audit complete. No vulnerabilities found.")
-        except json.JSONDecodeError:
-            # If it's not valid JSON, pip-audit might have thrown an error (e.g., network issue)
-            self.log_output.emit(f"⚠️ Supply Chain Audit could not parse results. Output: {self._output_buffer[:200]}")
-            # Emit -1 to indicate a network/parse failure, not a vulnerability
-            self.audit_finished.emit(-1, 0, [])
+            vulnerabilities = self._flatten_results(results)
+        except (json.JSONDecodeError, ValueError):
+            detail = (self._error_buffer or self._output_buffer).strip()[:200]
+            self.log_output.emit(
+                f"⚠️ Supply Chain Audit could not parse results (exit {exit_code}). Output: {detail}"
+            )
+            # -1 signals a network/parse failure, not a vulnerability.
+            self._emit_finished(-1, 0, [])
             return
 
-        self.audit_finished.emit(vuln_count, critical_count, vulnerabilities)
+        vuln_count = len(vulnerabilities)
+        # "Critical" here means no fixed version is available, not a CVSS severity.
+        critical_count = sum(1 for v in vulnerabilities if not v.get("fix_versions"))
+
+        if vuln_count:
+            self.log_output.emit(
+                f"✅ Supply Chain Audit complete. Found {vuln_count} known vulnerabilities "
+                f"({critical_count} with no fix available)."
+            )
+        else:
+            self.log_output.emit("✅ Supply Chain Audit complete. No vulnerabilities found.")
+
+        self._emit_finished(vuln_count, critical_count, vulnerabilities)

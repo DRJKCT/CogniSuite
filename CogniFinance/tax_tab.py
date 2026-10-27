@@ -1,385 +1,784 @@
-# tax_tab.py ver 0.1
-# For CogniFinance ver 1.8
-
+# tax_tab.py
 import os
+import re
+import logging
+from datetime import date
+from pathlib import Path
 from decimal import Decimal
+from typing import Dict, List, Optional
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout,
-    QLabel, QComboBox, QDateEdit, QPushButton, QTextEdit,
-    QScrollArea, QMessageBox, QFileDialog
+    QLabel, QComboBox, QListWidget, QListWidgetItem, QTreeWidget,
+    QTreeWidgetItem, QHeaderView, QAbstractItemView, QSizePolicy, QPushButton, QFileDialog, QMessageBox
 )
-from PyQt6.QtCore import Qt, QDate
+from PyQt6.QtCore import Qt, QLocale, QCoreApplication
 from PyQt6.QtGui import QFont
 
-from ledger import GeneralLedger
-from tax_manager import TaxTemplateManager
+from ledger import GeneralLedger, ZERO
+from tax_parser import (
+    TaxTemplateLoader, TemplateValidationError, ResolvedTemplateSet,
+    classify_base_recency, module_accepted_by_bases, localized, variant_choices,
+    LEVELS, display_label, pretty_name,
+)
+from tax_format import format_money
+from tax_profile import TaxProfileManager, record_selection, stored_layer, stored_module_enabled
+
+TAX_TEMPLATES_DIR = Path.home() / "CogniSuite" / "TaxTemplates"
+SHIPPED_DIR = TAX_TEMPLATES_DIR / "shipped"
+USER_DIR = TAX_TEMPLATES_DIR / "user"
+COMMUNITY_DIR = TAX_TEMPLATES_DIR / "community"
+
+logger = logging.getLogger(__name__)
+
+
+def _tier_info(tier_name: str):
+    """(icon, tooltip) for a template's trust tier. Static, so it goes through
+    QCoreApplication.translate rather than self.tr. Each call carries its own
+    literal so Qt's extraction tool (pylupdate6) can find it."""
+    if tier_name == "shipped":
+        return "✅", QCoreApplication.translate("TaxTab", "Official template, current")
+    if tier_name == "shipped_modified":
+        return "⚠️", QCoreApplication.translate(
+            "TaxTab", "This shipped file has been modified — reinstall the app to restore it"
+        )
+    if tier_name == "user_authored":
+        return "✏️", QCoreApplication.translate("TaxTab", "Your template")
+    if tier_name == "community":
+        return "🌐", QCoreApplication.translate("TaxTab", "Community template")
+    return "•", ""
 
 
 class TaxTab(QWidget):
-    """
-    Encapsulates the entire Taxes tab UI and logic.
-    Keeps ui_main.py clean by handling template selection,
-    summary rendering, dynamic sections, and XLSX export internally.
-    """
     def __init__(self, ledger: GeneralLedger, parent=None):
         super().__init__(parent)
         self.gl = ledger
-        self.template_manager = TaxTemplateManager()
-        self.available_templates = self.template_manager.load_available_templates()
+
+        self.profile_manager = TaxProfileManager(ledger)
+        # Last-used country / template layers / modules, restored below.
+        self._ui_state = self.profile_manager.load_ui_state()
+        self.loader = TaxTemplateLoader(
+            shipped_dir=str(SHIPPED_DIR),
+            user_dir=str(USER_DIR),
+            community_dir=str(COMMUNITY_DIR),
+        )
+
+        self.current_set: ResolvedTemplateSet = None
+        self.is_dark_mode = False
+        # Language for template text that offers translations ("fr_CA" -> "fr" -> "en").
+        self._lang = QLocale().name()
+
+        # Filled by _refresh_template_lists()
+        self._base_entries: List[dict] = []
+        self._module_entries: List[dict] = []
+        self._hidden_module_count = 0
+        self._last_carryforwards: Dict[str, object] = {}
 
         self._init_ui()
-        self.refresh_summary()
+        self._refresh_template_lists()
 
     def _init_ui(self):
-        # We use a QScrollArea so the tab remains usable even if the user
-        # adds many dynamic template sections.
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-
-        container_widget = QWidget()
-        layout = QVBoxLayout(container_widget)
-
-        # --- Date & Template Selection ---
-        range_box = QGroupBox("Tax Year / Period")
-        rlayout = QFormLayout()
-
-        self.combo_tax_template = QComboBox()
-        self.combo_tax_template.addItem("Standard (No Template)", userData=None)
-        for t_id, t_data in self.available_templates.items():
-            self.combo_tax_template.addItem(t_data.get("title", t_id), userData=t_id)
-        self.combo_tax_template.currentIndexChanged.connect(self.refresh_summary)
-
-        # ==========================================
-        # 2. NEW: Tax Rates / Year Selector (JSON)
-        # ==========================================
-        self.tax_year_combo = QComboBox()
-        self._refresh_tax_year_dropdown() # Populate it with JSON files
-        self.tax_year_combo.currentIndexChanged.connect(self.refresh_summary)
-        rlayout.addRow("Tax Rates/Year:", self.tax_year_combo)
-        # ==========================================
-
-        today = QDate.currentDate()
-        self.tax_start = QDateEdit()
-        self.tax_start.setCalendarPopup(True)
-        self.tax_start.setDate(QDate(today.year(), 1, 1))
-        self.tax_start.dateChanged.connect(self.refresh_summary)
-
-        self.tax_end = QDateEdit()
-        self.tax_end.setCalendarPopup(True)
-        self.tax_end.setDate(QDate(today.year(), 12, 31))
-        self.tax_end.dateChanged.connect(self.refresh_summary)
-
-        rlayout.addRow("Active Template:", self.combo_tax_template)
-        rlayout.addRow("Start:", self.tax_start)
-        rlayout.addRow("End:", self.tax_end)
-        range_box.setLayout(rlayout)
-        layout.addWidget(range_box)
-
-        # --- Action Buttons ---
-        btn_row = QHBoxLayout()
-
-        btn_export = QPushButton("Export Tax Report (XLSX)")
-        btn_export.clicked.connect(self.export_report)
-
-        year_layout = QHBoxLayout()
-        year_layout.addWidget(QLabel("Tax Year / Jurisdiction:"))
-
-        self.tax_year_combo = QComboBox()
-        self._refresh_tax_year_dropdown() # Populate it on startup
-        year_layout.addWidget(self.tax_year_combo, stretch=1)
-
-        # Connect it so the summary recalculates when the user changes the year
-        self.tax_year_combo.currentIndexChanged.connect(self.refresh_summary)
-
-
-        btn_add_template = QPushButton("Add Template Section")
-        btn_add_template.clicked.connect(self.add_dynamic_section)
-
-        btn_row.addWidget(btn_export)
-        btn_row.addWidget(btn_add_template)
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
-
-        # --- Summary Text Boxes ---
-        self.biz_summary = QTextEdit()
-        self.biz_summary.setReadOnly(True)
-        self.biz_summary.setFont(QFont("Monospace", 10))
-        layout.addWidget(self.biz_summary)
-
-        # self.med_summary = QTextEdit()
-        # self.med_summary.setReadOnly(True)
-        # self.med_summary.setFont(QFont("Monospace", 10))
-        # layout.addWidget(self.med_summary)
-
-        # --- Dynamic Templates Container ---
-        self.dynamic_templates_layout = QVBoxLayout()
-        layout.addLayout(self.dynamic_templates_layout)
-
-        scroll_area.setWidget(container_widget)
-
-        # Add the scroll area to the main tab layout
         main_layout = QVBoxLayout(self)
-        main_layout.addWidget(scroll_area)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(8)
+
+        # ---------------------------------------------------------
+        # 1. Template Selection (Prevents vertical stretching)
+        # ---------------------------------------------------------
+        template_box = QGroupBox(self.tr("1. Tax Template Selection"))
+        # THIS IS THE FIX: Forces the box to only be as tall as its contents
+        template_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+
+        t_layout = QFormLayout()
+        t_layout.setContentsMargins(8, 8, 8, 8) # Tight, even margins
+        t_layout.setVerticalSpacing(2)           # Minimal space between rows
+
+        self.country_combo = QComboBox()
+        self.country_combo.currentIndexChanged.connect(self._on_country_changed)
+        t_layout.addRow(self.tr("Country:"), self.country_combo)
+
+        # One row per jurisdiction level (national / regional / local). A
+        # row is hidden when the chosen country has no templates at that level.
+        self.layer_labels: Dict[str, QLabel] = {}
+        self.layer_combos: Dict[str, QComboBox] = {}
+        for level in LEVELS:
+            label = QLabel(self.tr("{label}:").format(label=self._default_level_label(level)))
+            combo = QComboBox()
+            combo.currentIndexChanged.connect(self._on_layers_changed)
+            self.layer_labels[level] = label
+            self.layer_combos[level] = combo
+            t_layout.addRow(label, combo)
+
+        # Variant (e.g. filing status): shown only when a selected template offers one.
+        self.variant_label = QLabel(self.tr("Filing status:"))
+        self.variant_combo = QComboBox()
+        self.variant_combo.currentIndexChanged.connect(self._on_variant_changed)
+        t_layout.addRow(self.variant_label, self.variant_combo)
+
+        self.modules_list = QListWidget()
+        self.modules_list.setFixedHeight(55) # Short, scrollable list
+        self.modules_list.itemChanged.connect(self._on_template_changed)
+        t_layout.addRow(self.tr("Modules:"), self.modules_list)
+
+        self.status_label = QLabel(self.tr("Select templates to begin."))
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("font-size: 11px;")
+        t_layout.addRow(self.tr("Status:"), self.status_label)
+
+        template_box.setLayout(t_layout)
+        main_layout.addWidget(template_box)
+
+        # ---------------------------------------------------------
+        # 2. Bucket Totals & Section Breakdown (Also prevent stretching)
+        # ---------------------------------------------------------
+        buckets_box = QGroupBox(self.tr("2. Tax Calculation and Estimation: This estimator is for planning purposes only. Please consult a qualified tax professional."))
+        buckets_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+
+        b_layout = QVBoxLayout()
+        b_layout.setContentsMargins(8, 8, 8, 8)
+        b_layout.setSpacing(6)
+
+        info_label = QLabel(self.tr("Summed totals for each tax bucket, broken down by profile section."))
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: #6B7280; font-size: 11px;")
+        b_layout.addWidget(info_label)
+
+        self.bucket_tree = QTreeWidget()
+        self.bucket_tree.setHeaderLabels([self.tr("Category / Section"), self.tr("Amount")])
+        self.bucket_tree.setColumnCount(2)
+
+        self.bucket_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.bucket_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.bucket_tree.setRootIsDecorated(True)
+        self.bucket_tree.setAlternatingRowColors(True)
+        self.bucket_tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.bucket_tree.setMaximumHeight(250)
+
+        b_layout.addWidget(self.bucket_tree)
+        self.lbl_recon_gap = QLabel(self.tr("Ledger Income vs. Bucket Assigned: --"))
+        self.lbl_recon_gap.setWordWrap(True)
+        self.lbl_recon_gap.setStyleSheet("color: #6B7280; font-size: 11px; margin-top: 4px;")
+        b_layout.addWidget(self.lbl_recon_gap)
+        buckets_box.setLayout(b_layout)
+        main_layout.addWidget(buckets_box)
+
+        action_layout = QHBoxLayout()
+        self.btn_edit_profile = QPushButton(self.tr("Edit Profile Section..."))
+        self.btn_edit_profile.clicked.connect(self._open_profile_editor)
+        action_layout.addWidget(self.btn_edit_profile)
+        self.btn_export = QPushButton(self.tr("Export Tax Report (XLSX)"))
+        self.btn_export.clicked.connect(self.export_report)
+        action_layout.addWidget(self.btn_export)
+        self.btn_save_cf = QPushButton(self.tr("Save Carry-forwards for Next Year"))
+        self.btn_save_cf.setEnabled(False)
+        self.btn_save_cf.clicked.connect(self._save_carryforwards)
+        action_layout.addWidget(self.btn_save_cf)
+        action_layout.addStretch()
+        main_layout.addLayout(action_layout)
+
+        # Push any remaining window space to the bottom
+        main_layout.addStretch()
+
+    @staticmethod
+    def tooltip_for(t_data: dict) -> str:
+        """
+        Return the hover tooltip for a template entry, based on its
+        trust tier. Empty string when the tier is unknown.
+        """
+        tier = t_data.get("tier")
+        tier_name = tier.tier if tier else "user_authored"
+        return _tier_info(tier_name)[1] if tier else (
+            _tier_info("user_authored")[1]
+        )
 
     # ------------------------------------------------------------------
-    # Core Logic Methods
+    # Template selection: country -> one template per level -> modules
     # ------------------------------------------------------------------
-    def refresh_summary(self):
-        from tax_calculator import estimate_tax_liability
+    def _refresh_template_lists(self):
+        available = self.loader.list_available_templates(lang=self._lang)
+        accepted = available.get("accepted", [])
+        self._base_entries = [t for t in accepted if t["template_type"] == "jurisdiction_base"]
+        self._module_entries = [t for t in accepted if t["template_type"] == "income_module"]
 
-        """Recalculates and renders the business and medical summaries."""
-        start = self.tax_start.date().toString("yyyy-MM-dd")
-        end = self.tax_end.date().toString("yyyy-MM-dd")
-        template_data = self._get_active_template_data()
+        previous_country = self.country_combo.currentData() or self._ui_state.get("country")
+        self.country_combo.blockSignals(True)
+        try:
+            self.country_combo.clear()
+            names = {}
+            for t in self._base_entries:
+                j = t["jurisdiction"]
+                if j.get("country_name") and j["country"] not in names:
+                    names[j["country"]] = localized(j["country_name"], self._lang)
+            for code in sorted({t["jurisdiction"]["country"] for t in self._base_entries}):
+                self.country_combo.addItem(f"{code} — {names[code]}" if code in names else code, userData=code)
+            idx = self.country_combo.findData(previous_country) if previous_country else -1
+            if idx >= 0:
+                self.country_combo.setCurrentIndex(idx)
+        finally:
+            self.country_combo.blockSignals(False)
 
-        raw_cats = template_data.get("categories") or template_data.get("target_categories") or {}
-        category_map = self._normalize_category_map(raw_cats)
-        medical_accounts = template_data.get("medical_accounts", [])
+        self._rebuild_layer_combos()
+        self._rebuild_variant_combo()
+        self._rebuild_modules_list()
+        self._on_template_changed()
 
-        # Business Summary
-        income = self.gl.business_income_total(start, end)
-        expenses_by_cat = self.gl.expenses_by_category(start, end, category_map=category_map)
-        total_expenses = sum(expenses_by_cat.values(), Decimal("0.00"))
-        net = income - total_expenses
+    def _on_country_changed(self, *_):
+        self._rebuild_layer_combos()
+        self._rebuild_variant_combo()
+        self._rebuild_modules_list()
+        self._on_template_changed()
 
-        template_title = template_data.get("title", "Tax Summary")
+    def _on_layers_changed(self, *_):
+        self._rebuild_variant_combo()
+        self._rebuild_modules_list()
+        self._on_template_changed()
 
-        # --- Build HTML Table for alignment, ease of use and consistency ---
-        html = []
-        html.append(f"<b>INCOME & EXPENSES ({template_title})</b><br>")
-        html.append("<hr>")
-        html.append(f"Period: {start} to {end}<br><br>")
+    def _on_variant_changed(self, *_):
+        name = self.variant_combo.currentData()
+        if name:
+            self.profile_manager.set_variant(self._section_name(), name)
+        self._on_template_changed()
 
-        html.append('<table width="100%" cellspacing="0" cellpadding="3" style="border-collapse: collapse; font-family: \'Inter\', sans-serif; font-size: 10pt;">')
+    def _section_name(self) -> str:
+        """Profile section for the selected country (each country keeps its own)."""
+        country = self.country_combo.currentData()
+        return self.profile_manager.resolve_section_name(country) if country else "Default"
 
-        row_idx = 0
-        def add_row(label, amount, bold=False, indent=False, is_total=False):
-            nonlocal row_idx
-            # Zebra striping logic
-            if is_total:
-                bg = "#e8e8e8" if row_idx % 2 == 0 else "#f0f0f0" # Slightly darker for totals
+    def _rebuild_variant_combo(self):
+        selected = [t for t in self._base_entries if t["template_id"] in self._selected_base_ids()]
+        heading, choices, default = variant_choices(selected, self._lang)
+        combo = self.variant_combo
+        previous = combo.currentData()
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            for name, label in choices:
+                combo.addItem(label, userData=name)
+            stored = self.profile_manager.get_variant(self._section_name()) if choices else None
+            for candidate in (previous, stored, default):
+                idx = combo.findData(candidate) if candidate else -1
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+                    break
+        finally:
+            combo.blockSignals(False)
+        self.variant_label.setVisible(bool(choices))
+        combo.setVisible(bool(choices))
+        if choices:
+            self.variant_label.setText(
+                self.tr("{label}:").format(label=heading or self.tr("Filing status"))
+            )
+
+    def _default_level_label(self, level: str) -> str:
+        return {
+            "national": self.tr("National"),
+            "regional": self.tr("Regional"),
+            "local": self.tr("Local"),
+        }[level]
+
+    def _level_label(self, level: str, entries: List[dict]) -> str:
+        """Row label for a level: the template's own wording ("Province", "State", ...) if it has one."""
+        for t in entries:
+            custom = (t.get("jurisdiction") or {}).get("level_label")
+            if custom:
+                return localized(custom, self._lang, default=self._default_level_label(level))
+        return self._default_level_label(level)
+
+    def _rebuild_layer_combos(self):
+        country = self.country_combo.currentData()
+        for level in LEVELS:
+            combo = self.layer_combos[level]
+            label = self.layer_labels[level]
+            entries = [
+                t for t in self._base_entries
+                if t["jurisdiction"]["country"] == country and t["jurisdiction"]["level"] == level
+            ]
+            previous = combo.currentData()
+            combo.blockSignals(True)
+            try:
+                combo.clear()
+                for t in entries:
+                    combo.addItem(self._format_template_label(t), userData=t["template_id"])
+                    combo.setItemData(combo.count() - 1, self.tooltip_for(t), Qt.ItemDataRole.ToolTipRole)
+                # Only the outermost level is mandatory.
+                if entries and level != "national":
+                    combo.addItem(self.tr("(none)"), userData=None)
+                idx = combo.findData(previous) if previous else -1
+                wanted = stored_layer(self._ui_state, country, level)
+                if idx < 0 and wanted:
+                    idx = combo.findData(wanted)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+                elif entries and level != "national" and wanted == "":
+                    combo.setCurrentIndex(combo.count() - 1)   # the user chose (none) last time
+                elif entries and level == "local":
+                    combo.setCurrentIndex(combo.count() - 1)   # local defaults to (none)
+            finally:
+                combo.blockSignals(False)
+            label.setVisible(bool(entries))
+            combo.setVisible(bool(entries))
+            if entries:
+                label.setText(self.tr("{label}:").format(label=self._level_label(level, entries)))
+
+    def _selected_base_ids(self) -> List[str]:
+        ids = [self.layer_combos[level].currentData() for level in LEVELS]
+        return [i for i in ids if i]
+
+    def _rebuild_modules_list(self):
+        """List only modules the selected bases accept (others could never load)."""
+        selected = [t for t in self._base_entries if t["template_id"] in self._selected_base_ids()]
+        previously = {
+            self.modules_list.item(i).data(Qt.ItemDataRole.UserRole):
+                self.modules_list.item(i).checkState()
+            for i in range(self.modules_list.count())
+        }
+        self._hidden_module_count = 0
+        self.modules_list.blockSignals(True)
+        try:
+            self.modules_list.clear()
+            for t in self._module_entries:
+                if not selected or not module_accepted_by_bases(selected, t):
+                    self._hidden_module_count += 1 if selected else 0
+                    continue
+                item = QListWidgetItem(self._format_template_label(t))
+                item.setData(Qt.ItemDataRole.UserRole, t["template_id"])
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                remembered = (
+                    Qt.CheckState.Checked
+                    if stored_module_enabled(self._ui_state, self.country_combo.currentData(), t["template_id"])
+                    else Qt.CheckState.Unchecked
+                )
+                item.setCheckState(previously.get(t["template_id"], remembered))
+                self.modules_list.addItem(item)
+        finally:
+            self.modules_list.blockSignals(False)
+
+    def _format_template_label(self, t_data: dict) -> str:
+        tier = t_data.get("tier")
+        tier_name = tier.tier if tier else "user_authored"
+
+        tier_icon, _tooltip = _tier_info(tier_name)
+        tp = t_data.get("tax_period")
+        year_info = tp.label if tp else (t_data.get("tax_year") or t_data.get("valid_from"))
+        name = t_data.get("display_name", t_data["template_id"])
+        return f"{tier_icon} {name} ({year_info})"
+
+    # ------------------------------------------------------------------
+    # Display helpers
+    # ------------------------------------------------------------------
+    def _money(self, amount) -> str:
+        """Format for the loaded set's currency using the user's locale."""
+        loc = QLocale()
+        return format_money(
+            amount,
+            self.current_set.currency if self.current_set else None,
+            decimal_point=loc.decimalPoint(),
+            group_separator=loc.groupSeparator(),
+        )
+
+    def _period_dates(self):
+        tp = self.current_set.tax_period
+        return tp.start, tp.end
+
+    def _ledger_currency(self) -> Optional[str]:
+        # The ledger doesn't record a currency yet; this activates the
+        # mismatch guard as soon as it exposes one.
+        return getattr(self.gl, "base_currency", None)
+
+    def _save_selection(self):
+        """Remember the current country / layer picks / module switches so the
+        tab opens the way the user left it."""
+        country = self.country_combo.currentData()
+        if not country:
+            return
+        layers = {level: (self.layer_combos[level].currentData() or "") for level in LEVELS}
+        modules = {}
+        for i in range(self.modules_list.count()):
+            item = self.modules_list.item(i)
+            modules[item.data(Qt.ItemDataRole.UserRole)] = item.checkState() == Qt.CheckState.Checked
+        self._ui_state = record_selection(self._ui_state, country, layers, modules)
+        self.profile_manager.save_ui_state(self._ui_state)
+
+    def _on_template_changed(self, *_):
+        self._save_selection()
+        base_ids = self._selected_base_ids()
+
+        mod_ids = []
+        for i in range(self.modules_list.count()):
+            item = self.modules_list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                mod_ids.append(item.data(Qt.ItemDataRole.UserRole))
+
+        if not base_ids:
+            self.status_label.setText(self.tr("Please select at least one jurisdiction template."))
+            self.status_label.setStyleSheet("color: orange; font-size: 11px;")
+            self.current_set = None
+            self.bucket_tree.clear()
+            return
+
+        try:
+            self.current_set = self.loader.load_layers(
+                base_ids, mod_ids,
+                ledger_currency=self._ledger_currency(),
+                variant=self.variant_combo.currentData() if self.variant_combo.count() else None,
+            )
+
+            today = date.today()
+            outdated = any(
+                classify_base_recency(layer, today=today) == "outdated"
+                for layer in self.current_set.layers
+            )
+            if outdated:
+                self.status_label.setText("⚠️ " + self.tr("Base is outdated. Computes normally, but verify rates."))
+                self.status_label.setStyleSheet("color: #d97706; font-weight: bold; font-size: 11px;")
             else:
-                bg = "#f9f9f9" if row_idx % 2 == 0 else "#ffffff" # Standard zebra
+                text = "✅ " + self.tr(
+                    "Loaded {n} module(s) for tax year {period} ({currency})."
+                ).format(
+                    n=len(self.current_set.modules),
+                    period=self.current_set.tax_period.label,
+                    currency=self.current_set.currency,
+                )
+                if self._hidden_module_count:
+                    text += " " + self.tr("{n} incompatible module(s) hidden.").format(
+                        n=self._hidden_module_count
+                    )
+                self.status_label.setText(text)
+                self.status_label.setStyleSheet("color: #059669; font-size: 11px;")
 
-            style = "font-weight: bold;" if bold else ""
-            label_style = f"padding-left: 20px; {style}" if indent else style
+            self._populate_bucket_tree()
+            self._run_reconciliation_check()
 
-            amt_str = f"{amount:,.2f}"
+        except TemplateValidationError as e:
+            self.current_set = None
+            self.status_label.setText("❌ " + self.tr("Validation Error: {error}").format(error=e))
+            self.status_label.setStyleSheet("color: #dc2626; font-weight: bold; font-size: 11px;")
+            self.bucket_tree.clear()
+        except BaseException as e:
+            import traceback
+            traceback.print_exc()
+            self.current_set = None
+            self.bucket_tree.clear()
 
-            html.append(f'<tr bgcolor="{bg}" style="{style}">')
-            html.append(f'<td align="left" style="{label_style}">{label}</td>')
-            html.append(f'<td align="right" style="{style}" width="120">{amt_str}</td>')
-            html.append('</tr>')
-            row_idx += 1
+    def _run_reconciliation_check(self):
+        """
+        Reconciliation check (income completeness): compare bucket-assigned
+        income against the ledger's total income for the period, surface any gap.
+        Scope: income only. Missing expense classifications don't trip this check.
+        """
+        # TODO: this check compares bucket-assigned income against the ledger's
+        # total income. Currently sums only positive bucket values, which loses
+        # loss-producing buckets (e.g. a rental property with a net loss this
+        # year). Revisit when the first loss case is exercised -- likely needs to
+        # sum all buckets that represent income-side activity rather than
+        # filtering by sign.
+        if not self.current_set:
+            self.lbl_recon_gap.setText(self.tr("Ledger Income vs. Bucket Assigned: --"))
+            return
 
-        add_row("Income", income, bold=True)
+        # The period is the loaded bases' tax period (calendar year unless
+        # the template declares otherwise). No separate user-selectable year.
+        start_date, end_date = self._period_dates()
 
-        # Section Header
-        html.append('<tr><td colspan="2" style="padding-top: 10px; font-weight: bold;">Expenses by Category:</td></tr>')
+        # 1. Ledger's total income for the period (Sum of all Revenue/Income accounts)
+        ledger_total_income = self.gl.business_income_total(start_date, end_date)
 
-        for cat, amt in expenses_by_cat.items():
-            if amt != 0:
-                add_row(cat, amt, indent=True)
+        # 2. Bucket-assigned income
+        # The category map UI is deferred, so we load the default section's map.
+        section_data = self.profile_manager.load_section(self._section_name())
+        category_map = section_data.get("category_map", {}) if section_data else {}
 
-        # Divider line
-        html.append('<tr><td colspan="2"><hr></td></tr>')
+        # aggregate_by_category preserves normal-balance sign (Revenue = cr - dr = positive)
+        bucket_totals = self.gl.aggregate_by_category(start_date, end_date, category_map)
 
-        add_row("Total Expenses", total_expenses, bold=True, is_total=True)
-        add_row("Net Income (Loss)", net, bold=True, is_total=True)
+        # Sum only positive bucket totals (income).
+        bucket_assigned_income = sum((amt for amt in bucket_totals.values() if amt > ZERO), ZERO)
 
-        html.append('</table>')
-        html.append("<br><i>Note: This is a planning tool only. Confirm with your CPA.</i>")
+        # 3. Calculate and surface the gap
+        gap = ledger_total_income - bucket_assigned_income
 
-        # Tax Liability Section
-        if net > Decimal("0.00"):
-
-            selected_template = "2025_2026_canada_ontario"
-            if hasattr(self, 'tax_year_combo'):
-                selected_template = self.tax_year_combo.currentData() or selected_template
-
-            est = estimate_tax_liability(net, tax_year=selected_template)
-            html.append("<br><br>")
-            html.append("<b>ESTIMATED TAX LIABILITY (T2125)</b><br>")
-            html.append("<hr>")
-            html.append('<table width="100%" cellspacing="0" cellpadding="3" style="border-collapse: collapse; font-family: \'Inter\', sans-serif; font-size: 10pt;">')
-
-            row_idx = 0 # Reset index for the new table
-            add_row("Federal Tax", est['fed_tax'])
-            add_row("Ontario Tax", est['prov_tax'])
-            add_row("CPP (Self-Employed)", est['cpp'])
-            add_row("Ontario Health Premium", est['ohp'])
-            add_row("Less: Basic Personal Credits", est['credits'])
-
-            html.append('<tr><td colspan="2"><hr></td></tr>')
-            add_row("TOTAL ESTIMATED TAX", est['total_tax'], bold=True, is_total=True)
-
-            html.append('</table>')
-            html.append(f"<br>Effective Tax Rate: <b>{est['effective_rate']:.1f}%</b><br><br>")
-            html.append("<i>(Assumes this T2125 is your total taxable income.<br>Does not account for RRSP, spouse, or other credits.)</i>")
+        if gap == ZERO:
+            self.lbl_recon_gap.setText("✅ " + self.tr("Reconciliation: Perfect match ({amount})").format(
+                amount=self._money(ledger_total_income)))
+            self.lbl_recon_gap.setStyleSheet("color: #059669; font-size: 11px; font-weight: bold;")
         else:
-            html.append("<br><br><i>No tax liability estimated (Net income is zero or negative).</i>")
+            self.lbl_recon_gap.setText("⚠️ " + self.tr(
+                "Reconciliation Gap: {gap} unassigned. (Ledger: {ledger} | Buckets: {buckets})"
+            ).format(
+                gap=self._money(gap),
+                ledger=self._money(ledger_total_income),
+                buckets=self._money(bucket_assigned_income),
+            ))
+            self.lbl_recon_gap.setStyleSheet("color: #d97706; font-size: 11px; font-weight: bold;")
 
-        self.biz_summary.setHtml("".join(html))
+    def _populate_bucket_tree(self):
 
-        """
-        "# Medical Summary
-        med_total = self.gl.medical_expenses_total(start, end, medical_accounts=medical_accounts)
-        mlines = [
-            "OUT‑OF‑POCKET MEDICAL/DENTAL EXPENSES",
-            "(for line 33099 / 33199 – planning only)", "=" * 50,
-            f"Period: {start} to {end}", "",
-            f"{'Total eligible medical expenses':<35} {med_total:>12,.2f}", "",
-            "Remember:",
-            "- Only amounts above the CRA threshold are creditable.",
-            "- Confirm eligibility with your tax preparer."
-        ]
-        self.med_summary.setPlainText("\n".join(mlines))
-        """
+        self.bucket_tree.clear()
+        self._last_carryforwards = {}
+        self.btn_save_cf.setEnabled(False)
+        if not self.current_set:
+            return
+
+        from tax_calculator import TaxCalculator, ComputationBlockedError
+
+        bold_font = QFont()
+        bold_font.setBold(True)
+
+        # ---- 1. Load the profile section ---------------------------------
+        # One "Default" section per country; multi-section summing is deferred per the brief.
+        section_data = self.profile_manager.load_section(self._section_name()) or {
+            "category_map": {},
+            "user_inputs": {},
+            "skipped_inputs": [],
+        }
+        category_map = section_data.get("category_map", {})
+
+        # Last year's carry-forwards arrive as inputs; anything the user has
+        # entered themselves for the same field wins.
+        carried = self.profile_manager.carryforward_inputs_for(
+            self._section_name(), self.current_set.tax_year
+        )
+        if carried:
+            section_data = dict(section_data)
+            section_data["user_inputs"] = {**carried, **section_data.get("user_inputs", {})}
+
+        # ---- 2. Aggregate each declared bucket ---------------------------
+        start_date, end_date = self._period_dates()
+
+        # Pass the full map once; aggregate_by_category returns one total
+        # per category key. Buckets the category map doesn't reference come
+        # back as 0.
+        aggregates = self.gl.aggregate_by_category(start_date, end_date, category_map)
+
+        # ---- 3. Compute --------------------------------------------------
+        calc = TaxCalculator(self.current_set, section_data, aggregates)
+        try:
+            result = calc.compute()
+
+        except ComputationBlockedError as e:
+            # A required user_input field is blank and hasn't been skipped.
+            # The full prompt-and-skip UI is deferred; surface the field name
+            # and stop.
+            self.status_label.setText(f"⚠️ {e}")
+            self.status_label.setStyleSheet(
+                "color: #d97706; font-weight: bold; font-size: 11px;"
+            )
+            return
+
+        except Exception as e:
+            # Any other computation failure -- surface it rather than a
+            # half-populated tree.
+            self.status_label.setText("❌ " + self.tr("Calculation error: {error}").format(error=e))
+            self.status_label.setStyleSheet(
+                "color: #dc2626; font-weight: bold; font-size: 11px;"
+            )
+            return
+
+        # ---- 4. Render ---------------------------------------------------
+        breakdown = result["breakdown"]
+
+        # Section 1: per-bucket taxable contributions
+        income_header = QTreeWidgetItem(self.bucket_tree)
+        income_header.setText(0, self.tr("Income"))
+        income_header.setFont(0, bold_font)
+
+        for bucket_name in sorted(self.current_set.all_buckets.keys()):
+            bucket = breakdown["buckets"].get(bucket_name, {})
+            raw = bucket.get("raw", ZERO)
+            taxable = bucket.get("taxable", ZERO)
+
+            row = QTreeWidgetItem(income_header)
+            row.setText(0, display_label(
+                self.current_set.all_buckets.get(bucket_name), pretty_name(bucket_name), self._lang
+            ))
+            row.setText(1, self._money(raw))
+            row.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            if taxable != raw:
+                sub = QTreeWidgetItem(row)
+                sub.setText(0, self.tr("Taxable (after primitive)"))
+                sub.setText(1, self._money(taxable))
+                sub.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        income_header.setExpanded(True)
+
+        # Section 2: pipeline totals
+        totals_header = QTreeWidgetItem(self.bucket_tree)
+        totals_header.setText(0, self.tr("Calculation"))
+        totals_header.setFont(0, bold_font)
+
+        def _add_total(parent, label, amount, bold=False):
+            item = QTreeWidgetItem(parent)
+            item.setText(0, label)
+            item.setText(1, self._money(amount))
+            item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            if bold:
+                item.setFont(0, bold_font)
+                item.setFont(1, bold_font)
+            return item
+
+        _add_total(totals_header, self.tr("Total Income"), result["total_income"])
+        _add_total(totals_header, self.tr("Less: Deductions"), breakdown["deductions"])
+        _add_total(totals_header, self.tr("Net Income"), result["net_income"], bold=True)
+        _add_total(totals_header, self.tr("Less: Pre Adjustments"), breakdown["pre_adjustments"])
+        adjusted_row = _add_total(
+            totals_header, self.tr("Adjusted Taxable Income"), result["adjusted_taxable_income"], bold=True
+        )
+        if breakdown.get("separate_income"):
+            _add_total(adjusted_row, self.tr("of which taxed separately"), breakdown["separate_income"])
+            adjusted_row.setExpanded(True)
+        tax_row = _add_total(totals_header, self.tr("Income Tax Owed"), result["income_tax_owed"])
+        # With more than one jurisdiction layer, show each layer's share.
+        if len(self.current_set.layers) > 1:
+            for layer in self.current_set.layers:
+                level = layer["jurisdiction"]["level"]
+                detail = breakdown["layers"].get(level, {})
+                name = localized(layer.get("display_name"), self._lang, default=layer.get("template_id", level))
+                _add_total(tax_row, name, detail.get("income_tax", ZERO))
+            tax_row.setExpanded(True)
+        # Note any alternative calculation (minimum tax, benefit cap, ...) that set the tax.
+        for layer in self.current_set.layers:
+            level = layer["jurisdiction"]["level"]
+            for alt_name in breakdown["layers"].get(level, {}).get("alternatives_applied", []):
+                alt_entry = next((a for a in layer.get("alternatives", []) if a.get("name") == alt_name), None)
+                note = QTreeWidgetItem(tax_row)
+                note.setText(0, self.tr("Alternative calculation applied: {name}").format(
+                    name=display_label(alt_entry, pretty_name(alt_name), self._lang)))
+                tax_row.setExpanded(True)
+        _add_total(totals_header, self.tr("Less: Credits"), breakdown["credits_applied"])
+        if breakdown.get("post_credit_adjustments"):
+            _add_total(totals_header, self.tr("Plus: Post-Credit Charges"), breakdown["post_credit_adjustments"])
+        if breakdown.get("refundable_credits"):
+            _add_total(totals_header, self.tr("Less: Refundable Credits"), breakdown["refundable_credits"])
+        _add_total(totals_header, self.tr("Tax After Credits"), result["tax_after_credits"], bold=True)
+
+        # Levies as their own children
+        levies_header = QTreeWidgetItem(totals_header)
+        levies_header.setText(0, self.tr("Levies"))
+        # A levy's label comes from its template entry; the breakdown is keyed by name
+        # (with a " (level)" suffix if two layers reuse a name).
+        levy_entries = {l.get("name"): l for l in self.current_set.all_levies}
+        for levy_key, amount in breakdown.get("levies", {}).items():
+            entry = levy_entries.get(levy_key) or levy_entries.get(levy_key.rsplit(" (", 1)[0])
+            _add_total(levies_header, display_label(entry, levy_key, self._lang), amount)
+        levies_header.setExpanded(True)
+
+        _add_total(
+            totals_header,
+            self.tr("ESTIMATED NET REFUND") if result["total_tax"] < ZERO else self.tr("TOTAL ESTIMATED TAX"),
+            abs(result["total_tax"]) if result["total_tax"] < ZERO else result["total_tax"],
+            bold=True,
+        )
+
+        totals_header.setExpanded(True)
+
+        # Amounts this calculation hands to next year.
+        carry = result.get("carryforwards") or {}
+        self._last_carryforwards = dict(carry)
+        self.btn_save_cf.setEnabled(bool(carry))
+        if carry:
+            cf_labels = {
+                cf["name"]: display_label(cf, pretty_name(cf["name"]), self._lang)
+                for layer in self.current_set.layers for cf in layer.get("carryforwards") or []
+            }
+            cf_header = QTreeWidgetItem(self.bucket_tree)
+            cf_header.setText(0, self.tr("Carry-forward to next year"))
+            cf_header.setFont(0, bold_font)
+            for name, amount in carry.items():
+                _add_total(cf_header, cf_labels.get(name, pretty_name(name)), amount)
+            cf_header.setExpanded(True)
+
+        # ---- 5. Warnings (negative bucket clamps, etc.) ------------------
+        warnings = breakdown.get("warnings", [])
+        if warnings:
+            warn_header = QTreeWidgetItem(self.bucket_tree)
+            warn_header.setText(0, self.tr("Warnings"))
+            warn_header.setFont(0, bold_font)
+            for w in warnings:
+                item = QTreeWidgetItem(warn_header)
+                item.setText(0, w)
+            warn_header.setExpanded(True)
+
+    def refresh_summary(self):
+        # Recompute using the currently selected template set.
+        # This is what gets called when the ledger changes and the tab
+        # needs to reflect new figures -- not when the templates themselves
+        # need to be re-enumerated from disk.
+        if self.current_set is not None:
+            self._populate_bucket_tree()
+            self._run_reconciliation_check()
 
     def export_report(self):
-        """Triggers the ledger's XLSX export for the current selection."""
-        start = self.tax_start.date().toString("yyyy-MM-dd")
-        end = self.tax_end.date().toString("yyyy-MM-dd")
-        template_data = self._get_active_template_data()
+        """Exports the tax report to XLSX using the loaded template's tax year."""
+        if not self.current_set:
+            QMessageBox.warning(self, self.tr("No Template"), self.tr("Please select a valid template set first."))
+            return
 
-        raw_cats = template_data.get("categories") or template_data.get("target_categories") or {}
-        category_map = self._normalize_category_map(raw_cats)
-        medical_accounts = template_data.get("medical_accounts", [])
+        # Per brief: the period comes from the loaded bases. No separate
+        # user-selectable year.
+        start_date, end_date = self._period_dates()
+        period_label = re.sub(r"[^\w.-]+", "_", self.current_set.tax_period.label)
 
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Tax Report", "", "Excel Files (*.xlsx);;All Files (*)"
+            self, self.tr("Export Tax Report"), f"Tax_Report_{period_label}.xlsx",
+            self.tr("Excel Files (*.xlsx);;All Files (*)")
         )
         if not path:
             return
         if not path.endswith(".xlsx"):
             path += ".xlsx"
 
+        # The category map UI is explicitly deferred per the brief.
+        # We pass an empty map for now; the ledger will export income
+        # and flat expenses without bucket categorization.
+        category_map = {}
+        medical_accounts = []
+
         try:
             self.gl.export_tax_report_xlsx(
-                start, end, path,
+                start_date, end_date, path,
                 category_map=category_map,
                 include_medical=True,
                 medical_accounts=medical_accounts,
             )
-            QMessageBox.information(self, "Export complete", f"Tax report exported to:\n{path}")
+            QMessageBox.information(self, self.tr("Export Complete"), self.tr("Tax report exported to:\n{path}").format(path=path))
         except Exception as e:
-            QMessageBox.critical(self, "Export failed", str(e))
+            QMessageBox.critical(self, self.tr("Export Failed"), str(e))
 
-    def add_dynamic_section(self):
-        """Adds a new configurable tax template block to the bottom of the tab."""
-        if not self.available_templates:
-            QMessageBox.warning(self, "No Templates", "No JSON tax templates found in 'tax_templates/' folder.")
+    def _save_carryforwards(self):
+        if not self.current_set or not self._last_carryforwards:
+            return
+        ok = self.profile_manager.save_carryforwards(
+            self._section_name(), self.current_set.tax_year, self._last_carryforwards
+        )
+        if ok:
+            QMessageBox.information(
+                self, self.tr("Carry-forwards Saved"),
+                self.tr("Saved for the {period} tax year. They will be applied automatically to the following year.").format(
+                    period=self.current_set.tax_period.label),
+            )
+        else:
+            QMessageBox.warning(self, self.tr("Save Failed"), self.tr("Could not write the carry-forwards to the database."))
+
+    def _open_profile_editor(self):
+        if self.current_set is None:
+            QMessageBox.information(
+                self, self.tr("No Template Loaded"),
+                self.tr("Load a template set before editing the profile.")
+            )
             return
 
-        group_box = QGroupBox("Configurable Tax Report Template")
-        g_layout = QVBoxLayout(group_box)
+        from tax_profile_dialog import ProfileEditDialog
 
-        combo = QComboBox()
-        for tid, tdata in self.available_templates.items():
-            combo.addItem(tdata.get("title", tid), userData=tid)
-        g_layout.addWidget(QLabel("Select Template Definition:"))
-        g_layout.addWidget(combo)
+        dlg = ProfileEditDialog(
+            ledger=self.gl,
+            template_set=self.current_set,
+            section_name=self._section_name(),
+            parent=self,
+        )
+        if dlg.exec() == dlg.DialogCode.Accepted:
+            # Profile changed -- recompute the tree using the new mapping.
+            self._populate_bucket_tree()
+            self._run_reconciliation_check()
 
-        report_output = QTextEdit()
-        report_output.setReadOnly(True)
-        report_output.setFont(QFont("Monospace", 9))
-        report_output.setPlaceholderText("Click generate to build report based on JSON schema criteria...")
-        g_layout.addWidget(report_output)
-
-        gen_btn = QPushButton("Generate Report for Template")
-
-        def generate_report():
-            selected_id = combo.currentData()
-            template_data = self.available_templates.get(selected_id)
-            if not template_data:
-                return
-
-            start = self.tax_start.date().toString("yyyy-MM-dd")
-            end = self.tax_end.date().toString("yyyy-MM-dd")
-
-            raw_cats = template_data.get("categories") or template_data.get("target_categories") or {}
-            target_cats = self._normalize_category_map(raw_cats)
-            expenses_by_cat = self.gl.expenses_by_category(start, end, category_map=target_cats)
-            total_exp = sum(expenses_by_cat.values(), Decimal("0.00"))
-
-            html = []
-            html.append(f"<b>REPORT: {template_data.get('title', 'Tax Summary')}</b><br>")
-            if template_data.get('description'):
-                html.append(f"<i>{template_data.get('description')}</i><br>")
-            html.append(f"Period: {start} to {end}<br><br>")
-            html.append("<b>Aggregated Categories:</b><br>")
-
-            html.append('<table width="100%" cellspacing="0" cellpadding="3" style="border-collapse: collapse; font-family:\'Inter\', sans-serif; font-size: 10pt;">')
-            row_idx = 0
-            for cat, amt in expenses_by_cat.items():
-                bg = "#f9f9f9" if row_idx % 2 == 0 else "#ffffff"
-                amt_str = f"{amt:,.2f}"
-                html.append(f'<tr bgcolor="{bg}">')
-                html.append(f'<td align="left" style="padding-left: 20px;">{cat}</td>')
-                html.append(f'<td align="right" width="120">{amt_str}</td>')
-                html.append('</tr>')
-                row_idx += 1
-
-            html.append('<tr><td colspan="2"><hr></td></tr>')
-            bg_total = "#e8e8e8"
-            html.append(f'<tr bgcolor="{bg_total}" style="font-weight: bold;">')
-            html.append(f'<td align="left">Total Aggregated</td>')
-            html.append(f'<td align="right" width="120">{total_exp:,.2f}</td>')
-            html.append('</tr>')
-            html.append('</table>')
-
-            # Render as HTML
-            report_output.setHtml("".join(html))
-
-        gen_btn.clicked.connect(generate_report)
-        combo.currentIndexChanged.connect(generate_report)
-
-        btn_remove = QPushButton("Remove Section")
-        btn_remove.clicked.connect(lambda: group_box.deleteLater())
-
-        btn_box = QHBoxLayout()
-        btn_box.addWidget(gen_btn)
-        btn_box.addWidget(btn_remove)
-        g_layout.addLayout(btn_box)
-
-        self.dynamic_templates_layout.addWidget(group_box)
-
-    # ------------------------------------------------------------------
-    # Internal Helpers
-    # ------------------------------------------------------------------
-    def _get_active_template_data(self) -> dict:
-        if not self.available_templates:
-            return {}
-        selected_id = self.combo_tax_template.currentData()
-        if not selected_id:
-            return {}
-        return self.available_templates.get(selected_id, {})
-
-    @staticmethod
-    def _normalize_category_map(raw_cats) -> dict:
-        if isinstance(raw_cats, dict):
-            return raw_cats
-        if isinstance(raw_cats, list):
-            mapped_cats = {}
-            for item in raw_cats:
-                if isinstance(item, dict):
-                    cat_name = item.get("name") or item.get("category")
-                    accs = item.get("accounts", [])
-                    if cat_name:
-                        mapped_cats[cat_name] = accs if isinstance(accs, list) else [accs]
-                elif isinstance(item, str):
-                    mapped_cats[item] = [item]
-            return mapped_cats
-        return {}
-    def _refresh_tax_year_dropdown(self):
-        """Populate the tax year selector with available JSON templates."""
-        from tax_calculator import get_available_tax_templates
-
-        self.tax_year_combo.clear()
-        templates = get_available_tax_templates()
-
-        # Sort them so the newest years appear at the top
-        for template in sorted(templates, reverse=True):
-            # Make it look pretty in the dropdown (e.g., "2025 2026 Canada Ontario")
-            display_name = template.replace("_", " ").title()
-            self.tax_year_combo.addItem(display_name, template)
+    def set_dark_mode(self, is_dark: bool):
+        self.is_dark_mode = is_dark

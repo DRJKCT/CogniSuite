@@ -10,23 +10,23 @@ from matplotlib.axes import Axes
 import matplotlib.pyplot as plt
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QComboBox, QDateEdit, QLabel, QHBoxLayout, QPushButton, QSizePolicy
 from PyQt6.QtCore import QDate
+from ui_helpers import AdvancedDisclosure
 from ledger import GeneralLedger, ZERO
 
 class ChartFactory:
     """Factory class for creating various financial charts directly onto an Axes."""
 
     @staticmethod
-    def income_vs_expenses_over_time(ledger: GeneralLedger, ax: Axes, start_date=None, end_date=None):
+    def income_vs_expenses_over_time(ledger: GeneralLedger, ax: Axes, start_date=None, end_date=None, theme=None):
         """Chart 1: Income vs Expenses Over Time (Line Chart)"""
         if not start_date or not end_date:
             end_date = datetime.now()
             start_date = end_date - timedelta(days=365)
 
-        # ✅ FIX: Dynamically group by day if the range is <= 31 days (e.g. Current Month)
         delta_days = (end_date - start_date).days
         group_by_day = delta_days <= 31
-
         months_data = {}
+
         for tx in ledger.transactions:
             try:
                 tx_date = datetime.strptime(tx.date[:10], "%Y-%m-%d")
@@ -35,7 +35,6 @@ class ChartFactory:
             if tx_date < start_date or tx_date > end_date:
                 continue
 
-            # ✅ FIX: Use daily grouping for short timeframes
             group_key = tx.date[:10] if group_by_day else tx.date[:7]
             if group_key not in months_data:
                 months_data[group_key] = {"income": ZERO, "expenses": ZERO}
@@ -57,27 +56,35 @@ class ChartFactory:
         expense_vals = [float(months_data[m]["expenses"]) for m in sorted_keys]
         x = range(len(sorted_keys))
 
-        ax.plot(x, income_vals, marker='o', label='Income', linewidth=2, color='#2e7d32')
-        ax.plot(x, expense_vals, marker='s', label='Expenses', linewidth=2, color='#c62828')
-        ax.fill_between(x, income_vals, expense_vals, alpha=0.2, where=[i>=e for i,e in zip(income_vals, expense_vals)], color='#2e7d32')
-        ax.fill_between(x, income_vals, expense_vals, alpha=0.2, where=[i<e for i,e in zip(income_vals, expense_vals)], color='#c62828')
+        ax.plot(x, income_vals, marker='o', label='Income', linewidth=2, color='#10B981') # Updated to Emerald
+        ax.plot(x, expense_vals, marker='s', label='Expenses', linewidth=2, color='#F87171') # Updated to Soft Red
+        ax.fill_between(x, income_vals, expense_vals, alpha=0.2, where=[i>=e for i,e in zip(income_vals, expense_vals)], color='#10B981')
+        ax.fill_between(x, income_vals, expense_vals, alpha=0.2, where=[i<e for i,e in zip(income_vals, expense_vals)], color='#F87171')
 
         ax.set_xticks(list(x))
-        # ✅ FIX: Format X-axis labels nicely (show MM-DD if grouping by day, else YYYY-MM)
         if group_by_day:
             labels = [k[5:] for k in sorted_keys]
         else:
             labels = sorted_keys
         ax.set_xticklabels(labels, rotation=45, ha='right')
-
         ax.set_xlabel('Day' if group_by_day else 'Month')
         ax.set_ylabel('Amount ($)')
         ax.set_title(f'Income vs Expenses ({start_date.strftime("%Y-%m-%d")} to {end_date.strftime("%Y-%m-%d")})')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+
+        # Themed Legend and Grid
+        leg = ax.legend()
+        if theme and leg:
+            leg.get_frame().set_facecolor(theme['legend_bg'])
+            leg.get_frame().set_edgecolor(theme['grid'])
+            for text in leg.get_texts():
+                text.set_color(theme['legend_text'])
+        if theme:
+            ax.grid(True, alpha=0.3, color=theme['grid'])
+        else:
+            ax.grid(True, alpha=0.3)
 
     @staticmethod
-    def expense_breakdown_by_category(ledger: GeneralLedger, ax: Axes, start_date=None, end_date=None):
+    def expense_breakdown_by_category(ledger: GeneralLedger, ax: Axes, start_date=None, end_date=None, theme=None):
         """Chart 3: Expense Breakdown by Category (Donut Chart)"""
         if not start_date or not end_date:
             end_date = datetime.now()
@@ -91,7 +98,6 @@ class ChartFactory:
                 continue
             if tx_date < start_date or tx_date > end_date:
                 continue
-
             for line in tx.lines:
                 acc = ledger.accounts.get(line.account_name)
                 if acc and acc.account_type == "Expense" and line.dr > ZERO:
@@ -103,30 +109,41 @@ class ChartFactory:
 
         categories = list(spending.keys())
         amounts = [float(spending[c]) for c in categories]
-        colors = plt.cm.Set3(range(len(categories)))
+
+        # FIX: Use a proper color palette that works with any number of categories
+        num_colors = len(categories)
+        if num_colors <= 12:
+            # Use Set3 colormap properly with normalized values
+            colors = [plt.cm.Set3(i/num_colors) for i in range(num_colors)]
+        else:
+            # For many categories, use a different approach
+             colors = [plt.cm.tab20(i / num_colors) for i in range(num_colors)]
 
         wedges, texts, autotexts = ax.pie(amounts, labels=categories, autopct='%1.1f%%',
-                                          colors=colors, startangle=90, pctdistance=0.85)
-        centre_circle = plt.Circle((0,0), 0.70, fc='white')
+                                        colors=colors, startangle=90, pctdistance=0.85)
+
+        # Themed center circle and text
+        centre_circle = plt.Circle((0,0), 0.70, fc=theme['ax_bg'] if theme else 'white')
         ax.add_artist(centre_circle)
+
+        text_color = theme['text'] if theme else "black"
         plt.setp(autotexts, size=9, weight="bold", color="white")
-        plt.setp(texts, size=8)
+        plt.setp(texts, size=8, color=text_color)
 
         title = f'Expense Breakdown ({start_date.strftime("%Y-%m-%d")} to {end_date.strftime("%Y-%m-%d")})'
         ax.set_title(title)
 
     @staticmethod
-    def net_worth_trend(ledger: GeneralLedger, ax: Axes, start_date=None, end_date=None):
+    def net_worth_trend(ledger: GeneralLedger, ax: Axes, start_date=None, end_date=None, theme=None):
         """Chart 4: Net Worth Trend (Line Chart)"""
         if not start_date or not end_date:
             end_date = datetime.now()
             start_date = end_date - timedelta(days=365)
 
-        # ✅ FIX: Dynamically group by day if the range is <= 31 days
         delta_days = (end_date - start_date).days
         group_by_day = delta_days <= 31
-
         monthly_net_worth = {}
+
         for tx in ledger.transactions:
             try:
                 tx_date = datetime.strptime(tx.date[:10], "%Y-%m-%d")
@@ -134,11 +151,9 @@ class ChartFactory:
                 continue
             if tx_date < start_date or tx_date > end_date:
                 continue
-
             group_key = tx.date[:10] if group_by_day else tx.date[:7]
             if group_key not in monthly_net_worth:
                 monthly_net_worth[group_key] = {"assets": ZERO, "liabilities": ZERO}
-
             for line in tx.lines:
                 acc = ledger.accounts.get(line.account_name)
                 if not acc: continue
@@ -160,24 +175,26 @@ class ChartFactory:
             net_worth_vals.append(float(cum_assets - cum_liab))
 
         x = range(len(sorted_keys))
-        ax.plot(x, net_worth_vals, marker='o', linewidth=2, color='#1565c0', markersize=6)
-        ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
-        ax.set_xticks(list(x))
+        ax.plot(x, net_worth_vals, marker='o', linewidth=2, color='#3B82F6', markersize=6) # Updated to modern blue
 
-        # ✅ FIX: Format X-axis labels nicely
+        # Themed zero-line and grid
+        ax.axhline(y=0, color=theme['grid'] if theme else 'gray', linestyle='--', alpha=0.5)
+        ax.set_xticks(list(x))
         if group_by_day:
             labels = [k[5:] for k in sorted_keys]
         else:
             labels = sorted_keys
         ax.set_xticklabels(labels, rotation=45, ha='right')
-
         ax.set_xlabel('Day' if group_by_day else 'Month')
         ax.set_ylabel('Net Worth ($)')
         ax.set_title(f'Net Worth Trend ({start_date.strftime("%Y-%m-%d")} to {end_date.strftime("%Y-%m-%d")})')
-        ax.grid(True, alpha=0.3)
+        if theme:
+            ax.grid(True, alpha=0.3, color=theme['grid'])
+        else:
+            ax.grid(True, alpha=0.3)
 
     @staticmethod
-    def top_spending_categories(ledger: GeneralLedger, ax: Axes, start_date=None, end_date=None, top_n: int = 10):
+    def top_spending_categories(ledger: GeneralLedger, ax: Axes, start_date=None, end_date=None, top_n: int = 10, theme=None):
         """Chart 6: Top 10 Spending Categories (Horizontal Bar Chart)"""
         if not start_date or not end_date:
             end_date = datetime.now()
@@ -191,7 +208,6 @@ class ChartFactory:
                 continue
             if tx_date < start_date or tx_date > end_date:
                 continue
-
             for line in tx.lines:
                 acc = ledger.accounts.get(line.account_name)
                 if acc and acc.account_type == "Expense" and line.dr > ZERO:
@@ -204,9 +220,9 @@ class ChartFactory:
         sorted_categories = sorted(spending.items(), key=lambda x: x[1], reverse=True)[:top_n]
         categories = [c[0] for c in sorted_categories][::-1]
         amounts = [float(c[1]) for c in sorted_categories][::-1]
-
         y = range(len(categories))
-        bars = ax.barh(y, amounts, color='#1976d2', alpha=0.8)
+
+        bars = ax.barh(y, amounts, color='#10B981', alpha=0.8) # Updated to Emerald
         for bar, amount in zip(bars, amounts):
             ax.text(amount, bar.get_y() + bar.get_height()/2, f' ${amount:,.0f}',
                    va='center', ha='left', fontsize=9)
@@ -214,13 +230,15 @@ class ChartFactory:
         ax.set_yticks(list(y))
         ax.set_yticklabels(categories, fontsize=9)
         ax.set_xlabel('Amount ($)')
-
         title = f'Top {top_n} Spending Categories ({start_date.strftime("%Y-%m-%d")} to {end_date.strftime("%Y-%m-%d")})'
         ax.set_title(title)
-        ax.grid(True, alpha=0.3, axis='x')
+        if theme:
+            ax.grid(True, alpha=0.3, axis='x', color=theme['grid'])
+        else:
+            ax.grid(True, alpha=0.3, axis='x')
 
     @staticmethod
-    def year_over_year_comparison(ledger: GeneralLedger, ax: Axes, category: Optional[str] = None):
+    def year_over_year_comparison(ledger: GeneralLedger, ax: Axes, category: Optional[str] = None, theme=None):
         """Chart 8: Year-over-Year Comparison (Grouped Bar Chart)"""
         current_year = datetime.now().year
         years = [current_year - 1, current_year]
@@ -234,11 +252,9 @@ class ChartFactory:
             year = tx_date.year
             if year not in years: continue
             month = tx_date.month
-
             for line in tx.lines:
                 acc = ledger.accounts.get(line.account_name)
                 if not acc: continue
-                # Filter by specific category if selected
                 if category and line.account_name != category: continue
                 if acc.account_type == "Expense" and line.dr > ZERO:
                     year_month_data[year][month] += line.dr
@@ -247,26 +263,34 @@ class ChartFactory:
         month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
         x = range(len(months))
         width = 0.35
-
         year1_vals = [float(year_month_data[years[0]][m]) for m in months]
         year2_vals = [float(year_month_data[years[1]][m]) for m in months]
 
-        ax.bar([i - width/2 for i in x], year1_vals, width, label=str(years[0]), alpha=0.8, color='#78909c')
-        ax.bar([i + width/2 for i in x], year2_vals, width, label=str(years[1]), alpha=0.8, color='#1565c0')
+        ax.bar([i - width/2 for i in x], year1_vals, width, label=str(years[0]), alpha=0.8, color='#6B7280') # Updated to modern gray
+        ax.bar([i + width/2 for i in x], year2_vals, width, label=str(years[1]), alpha=0.8, color='#10B981') # Updated to Emerald
 
         ax.set_xticks(list(x))
         ax.set_xticklabels(month_names)
         ax.set_xlabel('Month')
         ax.set_ylabel('Expenses ($)')
-
         title = f'Year-over-Year Comparison'
         if category:
             title += f' - {category}'
         else:
             title += ' (All Expenses)'
         ax.set_title(title)
-        ax.legend()
-        ax.grid(True, alpha=0.3, axis='y')
+
+        # Themed Legend and Grid
+        leg = ax.legend()
+        if theme and leg:
+            leg.get_frame().set_facecolor(theme['legend_bg'])
+            leg.get_frame().set_edgecolor(theme['grid'])
+            for text in leg.get_texts():
+                text.set_color(theme['legend_text'])
+        if theme:
+            ax.grid(True, alpha=0.3, axis='y', color=theme['grid'])
+        else:
+            ax.grid(True, alpha=0.3, axis='y')
 
 
 class ChartsTab(QWidget):
@@ -275,7 +299,37 @@ class ChartsTab(QWidget):
     def __init__(self, ledger: GeneralLedger, parent=None):
         super().__init__(parent)
         self.ledger = ledger
+        self.is_dark_mode = False
+        self.is_simple_mode = False
         self._init_ui()
+        self.refresh_charts()
+
+    def set_dark_mode(self, is_dark: bool):
+        self.is_dark_mode = is_dark
+        self.refresh_charts()
+
+    def set_simple_mode(self, simple: bool):
+        """Simple Mode: keep chart type and timeframe visible; the
+        specialist category filter hides behind a reveal.
+
+        The period stays user-chosen (a decision, not an expert
+        control). "Custom Range" stays in the dropdown; only the
+        category filter collapses, and the chart title continues to
+        name the selected category, so hiding the control does not
+        hide the fact.
+        """
+        simple = bool(simple)
+        if simple == self.is_simple_mode:
+            return
+        self.is_simple_mode = simple
+        # In Simple Mode the category filter is hidden unconditionally;
+        # Pro Mode lets _update_controls_visibility manage it.
+        if simple:
+            self.category_combo.setVisible(False)
+            self.category_label.setVisible(False)
+        else:
+            # Hand back to the tab's own visibility rules.
+            self._update_controls_visibility()
         self.refresh_charts()
 
     def _init_ui(self):
@@ -300,7 +354,8 @@ class ChartsTab(QWidget):
         self.chart_type_combo.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)  # ✅ Prevent expansion
         row1.addWidget(self.chart_type_combo)
 
-        row1.addWidget(QLabel("Category (YoY):"))
+        self.category_label = QLabel("Category (YoY):")
+        row1.addWidget(self.category_label)
         self.category_combo = QComboBox()
         self.category_combo.addItem("All Expenses", None)
         for name, acc in sorted(self.ledger.accounts.items()):
@@ -385,21 +440,42 @@ class ChartsTab(QWidget):
         self.start_edit.setVisible(timeframe == "Custom Range")
         self.end_edit.setVisible(timeframe == "Custom Range")
 
-        # Category filter only applies to YoY comparison
+        # Category filter only applies to YoY comparison.
+        # In Simple Mode the disclosure owns the filter; don't override.
         chart_type = self.chart_type_combo.currentData()
         is_yoy = (chart_type == "yoy_comparison")
-        self.category_combo.setVisible(is_yoy)
-        # Hide the label for category too (it's the widget immediately preceding it in row1)
-        for i in range(self.layout().count()):
-            item = self.layout().itemAt(i)
-            if item and item.layout() == self.findChild(QHBoxLayout) and item.layout().indexOf(self.category_combo) > 0:
-                # Find the label right before category_combo
-                pass # Qt layout label hiding is tricky, we'll just let the combo hide.
+        in_simple = getattr(self, 'is_simple_mode', False)
+        self.category_combo.setVisible(is_yoy and not in_simple)
+        self.category_label.setVisible(is_yoy and not in_simple)
 
     def refresh_charts(self):
         """Refresh the current chart by calculating the exact start/end dates."""
+
+        if getattr(self, 'is_dark_mode', False):
+            theme = {
+                'fig_bg': '#111318', 'ax_bg': '#1A1D24', 'text': '#F3F4F6',
+                'grid': '#2D323C', 'tick': '#9CA3AF', 'legend_bg': '#1A1D24', 'legend_text': '#F3F4F6'
+            }
+        else:
+            theme = {
+                'fig_bg': '#F3F4F6', 'ax_bg': '#FFFFFF', 'text': '#111827',
+                'grid': '#E5E7EB', 'tick': '#6B7280', 'legend_bg': '#FFFFFF', 'legend_text': '#111827'
+            }
+
         self.figure.clear()
+
+        # 2. APPLY THEME TO FIGURE AND AXES
+        self.figure.set_facecolor(theme['fig_bg'])
         ax = self.figure.add_subplot(111)
+        ax.set_facecolor(theme['ax_bg'])
+
+        ax.title.set_color(theme['text'])
+        ax.xaxis.label.set_color(theme['text'])
+        ax.yaxis.label.set_color(theme['text'])
+        ax.tick_params(colors=theme['tick'], labelcolor=theme['tick'])
+
+        for spine in ax.spines.values():
+            spine.set_edgecolor(theme['grid'])
 
         chart_type = self.chart_type_combo.currentData()
         timeframe = self.timeframe_combo.currentText()
@@ -435,15 +511,15 @@ class ChartsTab(QWidget):
 
         try:
             if chart_type == "income_expenses":
-                ChartFactory.income_vs_expenses_over_time(self.ledger, ax, start_date=start_date, end_date=end_date)
+                ChartFactory.income_vs_expenses_over_time(self.ledger, ax, start_date=start_date, end_date=end_date, theme=theme)
             elif chart_type == "expense_pie":
-                ChartFactory.expense_breakdown_by_category(self.ledger, ax, start_date=start_date, end_date=end_date)
+                ChartFactory.expense_breakdown_by_category(self.ledger, ax, start_date=start_date, end_date=end_date, theme=theme)
             elif chart_type == "net_worth":
-                ChartFactory.net_worth_trend(self.ledger, ax, start_date=start_date, end_date=end_date)
+                ChartFactory.net_worth_trend(self.ledger, ax, start_date=start_date, end_date=end_date, theme=theme)
             elif chart_type == "top_categories":
-                ChartFactory.top_spending_categories(self.ledger, ax, start_date=start_date, end_date=end_date, top_n=10)
+                ChartFactory.top_spending_categories(self.ledger, ax, start_date=start_date, end_date=end_date, top_n=10, theme=theme)
             elif chart_type == "yoy_comparison":
-                ChartFactory.year_over_year_comparison(self.ledger, ax, category=category)
+                ChartFactory.year_over_year_comparison(self.ledger, ax, category=category, theme=theme)
 
             self.figure.tight_layout()
             self.canvas.draw()
