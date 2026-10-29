@@ -35,6 +35,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Tuple, Optional
 
 from lot_matcher import Lot, consume_fifo, consume_specific_lots, LotMatcherError
+from currency import to_base, parse_decimal, normalize_currency
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +175,55 @@ class CryptoEngine:
                 ok, msg = self.gl.create_account(name, acc_type, report_line)
                 if not ok:
                     logger.warning(f"CryptoEngine could not create '{name}': {msg}")
+
+    # ---------------------------------------------------------------
+    # Multi-currency
+    #
+    # Rules (same in both engines):
+    #   * Lots, cost basis, proceeds and realized gains are ALWAYS held
+    #     in the ledger's BASE currency. lot_matcher never sees anything else.
+    #   * Price and fees passed to buy()/sell(), and the amount passed to
+    #     record_dividend(), are in the CASH ACCOUNT's own currency (what
+    #     actually left or arrived). If that account is foreign, the amount
+    #     is converted to base at the rate for the transaction date (or an
+    #     explicit fx_rate=), and the cash leg posts through the ledger's
+    #     FxInfo so the native amount and rate are stored on the line.
+    #   * Holding accounts stay in the base currency, carried at cost.
+    # ---------------------------------------------------------------
+
+    def _cash_leg(self, cash_account, native_amount, date, fx_rate=None, fx_rate_source=None):
+        """(base_amount, fx) for the cash side of a trade. fx is None --
+        and the amount is returned untouched -- for a base-currency or
+        unknown account (the ledger reports a missing account itself).
+        Raises ValueError (e.g. no rate on file) for the caller to return."""
+        acc = self.gl.accounts.get(cash_account)
+        if acc is None or acc.currency == self.gl.base_currency:
+            return native_amount, None
+        return self.gl.convert_to_base(cash_account, native_amount, date, fx_rate, fx_rate_source)
+
+    def _amount_to_base(self, amount, currency, date, fx_rate=None):
+        """Convert an amount that has no cash account to carry its currency
+        (a reinvested dividend, a reward's fair market value). Returns
+        (base_amount, note); note is text for the ledger description so the
+        native amount and rate stay visible. currency=None means base."""
+        if not currency:
+            return amount, ""
+        code = normalize_currency(currency)
+        if code == self.gl.base_currency:
+            return amount, ""
+        if fx_rate is not None:
+            rate = parse_decimal(fx_rate, "rate")
+            if rate <= ZERO:
+                raise ValueError("Rate must be greater than zero.")
+        else:
+            found = self.gl.get_fx_rate(code, self.gl.base_currency, date)
+            if found is None:
+                raise ValueError(
+                    f"No {code}->{self.gl.base_currency} rate on or before {date}. "
+                    "Add one with set_fx_rate() or pass fx_rate=."
+                )
+            rate = found.rate
+        return to_base(amount, rate), f" [{amount} {code} @ {rate}]"
 
     # ---------------------------------------------------------------
     # Wallets
@@ -322,7 +372,10 @@ class CryptoEngine:
     # ---------------------------------------------------------------
 
     def buy(self, asset: str, wallet_name: str, date: str, quantity: Decimal, price_per_unit: Decimal,
-            cash_account: str, fees: Decimal = ZERO, description: Optional[str] = None) -> Tuple[bool, str]:
+            cash_account: str, fees: Decimal = ZERO, description: Optional[str] = None,
+            fx_rate: Optional[Decimal] = None, fx_rate_source: Optional[str] = None) -> Tuple[bool, str]:
+        # price_per_unit and fees are in the CASH ACCOUNT's currency; a foreign
+        # account is converted to base at the rate for `date` (or fx_rate).
         holding = self.get_holding(asset, wallet_name)
         if holding is None:
             return False, f"Unknown holding '{asset}' in wallet '{wallet_name}'. Call add_holding() first."
@@ -331,12 +384,17 @@ class CryptoEngine:
         if price_per_unit < ZERO or fees < ZERO:
             return False, "Price and fees cannot be negative."
 
-        total_cost = (quantity * price_per_unit) + fees
-        desc = description or f"Buy {quantity} {asset} ({wallet_name}) @ {price_per_unit}"
+        total_native = (quantity * price_per_unit) + fees
+        try:
+            total_cost, fx = self._cash_leg(cash_account, total_native, date, fx_rate, fx_rate_source)
+        except ValueError as e:
+            return False, str(e)
+        ccy = f" {fx.currency}" if fx else ""
+        desc = description or f"Buy {quantity} {asset} ({wallet_name}) @ {price_per_unit}{ccy}"
 
         ok, msg = self.gl.record_transaction(
             date, desc,
-            [(holding.account_name, total_cost, ZERO), (cash_account, ZERO, total_cost)],
+            [(holding.account_name, total_cost, ZERO), (cash_account, ZERO, total_cost, fx)],
         )
         if not ok:
             return False, msg
@@ -365,7 +423,11 @@ class CryptoEngine:
     def sell(self, asset: str, wallet_name: str, date: str, quantity: Decimal, price_per_unit: Decimal,
               cash_account: str, fees: Decimal = ZERO,
               specific_selections: Optional[List[Tuple[str, Decimal]]] = None,
-              description: Optional[str] = None) -> Tuple[bool, str]:
+              description: Optional[str] = None,
+              fx_rate: Optional[Decimal] = None, fx_rate_source: Optional[str] = None) -> Tuple[bool, str]:
+        # price_per_unit and fees are in the CASH ACCOUNT's currency. A foreign
+        # account's proceeds are converted to base at the rate for `date` (or
+        # fx_rate); the gain is computed entirely in base against base cost.
         holding = self.get_holding(asset, wallet_name)
         if holding is None:
             return False, f"Unknown holding '{asset}' in wallet '{wallet_name}'."
@@ -380,7 +442,15 @@ class CryptoEngine:
         finally:
             conn.close()
 
-        net_proceeds_per_unit = price_per_unit - (fees / quantity)
+        gross_native = (quantity * price_per_unit) - fees
+        try:
+            gross_base, fx = self._cash_leg(cash_account, gross_native, date, fx_rate, fx_rate_source)
+        except ValueError as e:
+            return False, str(e)
+        if fx is not None:
+            net_proceeds_per_unit = gross_base / quantity
+        else:
+            net_proceeds_per_unit = price_per_unit - (fees / quantity)
 
         try:
             if specific_selections is not None:
@@ -401,11 +471,11 @@ class CryptoEngine:
         # rounding all three independently can drift the books a cent
         # out of balance when fees don't divide evenly across quantity.
         cost_basis = match.total_cost_basis.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        gross_proceeds = ((quantity * price_per_unit) - fees).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        gross_proceeds = gross_base.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         gain = gross_proceeds - cost_basis
 
         lines = [
-            (cash_account, gross_proceeds, ZERO),
+            (cash_account, gross_proceeds, ZERO, fx),
             (holding.account_name, ZERO, cost_basis),
         ]
         if gain > ZERO:
@@ -413,7 +483,7 @@ class CryptoEngine:
         elif gain < ZERO:
             lines.append((REALIZED_LOSSES_ACCOUNT, -gain, ZERO))
 
-        desc = description or f"Sell {quantity} {asset} ({wallet_name}) @ {price_per_unit}"
+        desc = description or f"Sell {quantity} {asset} ({wallet_name}) @ {price_per_unit}{' ' + fx.currency if fx else ''}"
         ok, msg = self.gl.record_transaction(date, desc, lines)
         if not ok:
             return False, msg
@@ -581,8 +651,11 @@ class CryptoEngine:
             if row is None:
                 return None
             date, description, reconciled, is_voided = row
-            cur.execute("SELECT account_name, dr, cr FROM sql_transaction_lines WHERE tx_id = ?", (tx_id,))
-            lines = [(acc, Decimal(dr) if dr else ZERO, Decimal(cr) if cr else ZERO) for acc, dr, cr in cur.fetchall()]
+            cur.execute(self.gl._LINE_SELECT_SQL, (tx_id,))
+            # Lines come back as ledger TransactionLine objects, so a foreign-
+            # currency cash leg keeps its native amount and rate -- the undo
+            # reverses it at exactly the rate it was posted at.
+            lines = [self.gl._line_from_row(r) for r in cur.fetchall()]
             return {"date": date, "description": description, "reconciled": bool(reconciled),
                     "is_voided": bool(is_voided), "lines": lines}
         finally:
@@ -640,11 +713,11 @@ class CryptoEngine:
         if original["reconciled"]:
             return False, "Cannot undo a reconciled transaction. Unreconcile it first."
 
-        lock_msg = self.gl.period_lock_violation(original["date"], [acc for acc, _, _ in original["lines"]])
+        lock_msg = self.gl.period_lock_violation(original["date"], [l.account_name for l in original["lines"]])
         if lock_msg:
             return False, lock_msg
 
-        offsetting_lines = [(acc, cr, dr) for acc, dr, cr in original["lines"]]
+        offsetting_lines = [(l.account_name, l.cr, l.dr, l.fx) for l in original["lines"]]
         ok, msg = self.gl.record_transaction(
             original["date"], f"UNDO: {original['description']}", offsetting_lines,
         )
@@ -678,7 +751,9 @@ class CryptoEngine:
 
     def record_staking_reward(self, asset: str, wallet_name: str, date: str, quantity: Decimal,
                                fmv_per_unit: Decimal, kind: str = "staking",
-                               description: Optional[str] = None) -> Tuple[bool, str]:
+                               description: Optional[str] = None,
+                               currency: Optional[str] = None,
+                               fx_rate: Optional[Decimal] = None) -> Tuple[bool, str]:
         """Record crypto received as a reward (staking, protocol
         reward, airdrop) into an existing (asset, wallet) holding.
 
@@ -715,10 +790,17 @@ class CryptoEngine:
                 "aren't supported in v1."
             )
 
-        income = (quantity * fmv_per_unit).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        # `currency` (optional) is the currency fmv_per_unit is quoted in. No cash
+        # account exists to carry it, so it is converted to base here and the native
+        # figures are kept in the description. Omitted = already in base.
+        try:
+            income, fx_note = self._amount_to_base(quantity * fmv_per_unit, currency, date, fx_rate)
+        except ValueError as e:
+            return False, str(e)
+        income = income.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         if income <= ZERO:
             return False, "The received amount is worth less than one cent at that price; nothing to record."
-        desc = description or f"{kind.capitalize()} received: {quantity} {asset} ({wallet_name}) @ {fmv_per_unit}"
+        desc = description or f"{kind.capitalize()} received: {quantity} {asset} ({wallet_name}) @ {fmv_per_unit}{fx_note}"
 
         ok, msg = self.gl.record_transaction(
             date, desc,

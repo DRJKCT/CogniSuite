@@ -1,4 +1,4 @@
-#Ledger v1.2
+#Ledger v1.3 (multi-currency foundation: phases 1-2)
 #For CogniFinance ver 0.9.6
 
 import os
@@ -15,6 +15,10 @@ from sqlcipher3 import dbapi2 as sqlite3
 from calendar import monthrange
 
 from config import BACKUP_DIR
+from currency import (
+    DEFAULT_BASE_CURRENCY, FxInfo, FxRate, normalize_currency, minor_unit,
+    quantize_native, quantize_rate, to_base, derive_rate, fx_tolerance, parse_decimal,
+)
 from period_lock import PeriodLocks, PeriodLockMixin, PeriodLockedError
 from merchant_normalization import normalize_merchant
 from recurring_engine import (
@@ -77,6 +81,23 @@ class TransactionLine:
                                # or any line from record_transaction's
                                # plain 3-tuple input, which never had one
                                # to begin with).
+    # Foreign-currency detail. None for any line posted to a base-currency
+    # account. When present, dr/cr above remain the BASE amounts (so every
+    # report and the balance check work unchanged) and fx carries the
+    # native amount, the rate used and where it came from.
+    fx: Optional[FxInfo] = None
+
+    @property
+    def native_dr(self) -> Decimal:
+        if self.fx is None:
+            return self.dr
+        return self.fx.native if self.dr > ZERO else quantize_native(0, self.fx.currency)
+
+    @property
+    def native_cr(self) -> Decimal:
+        if self.fx is None:
+            return self.cr
+        return self.fx.native if self.cr > ZERO else quantize_native(0, self.fx.currency)
 
 
 @dataclass
@@ -242,7 +263,7 @@ class Account:
         "Revenue": "CR",
     }
 
-    def __init__(self, name: str, account_type: str, report_line: Optional[str] = None):
+    def __init__(self, name: str, account_type: str, report_line: Optional[str] = None, currency: Optional[str] = None):
         if account_type not in self.NORMAL_BALANCES:
             raise ValueError("Invalid account type.")
         if report_line is not None and REPORT_LINE_TO_TYPE.get(report_line) != account_type:
@@ -250,6 +271,9 @@ class Account:
         self.name = name
         self.account_type = account_type
         self.report_line = report_line
+        # Effective currency of this account. The ledger passes the resolved
+        # value (explicit code, or the ledger's base currency).
+        self.currency = currency or DEFAULT_BASE_CURRENCY
         self.entries: List[Dict[str, Any]] = []
 
     @property
@@ -259,14 +283,28 @@ class Account:
         and fall back to a flat listing rather than a fake bucket label."""
         return REPORT_LINE_TO_SUBCATEGORY.get(self.report_line)
 
-    def add_entry(self, date: str, description: str, dr: Decimal, cr: Decimal):
-        self.entries.append({"date": date, "description": description, "dr": money(dr), "cr": money(cr)})
+    def add_entry(self, date: str, description: str, dr: Decimal, cr: Decimal,
+                  ndr: Optional[Decimal] = None, ncr: Optional[Decimal] = None):
+        # dr/cr are BASE amounts. ndr/ncr are the same amounts in the account's
+        # own currency (equal to dr/cr for a base-currency account).
+        dr, cr = money(dr), money(cr)
+        self.entries.append({
+            "date": date, "description": description, "dr": dr, "cr": cr,
+            "ndr": dr if ndr is None else ndr, "ncr": cr if ncr is None else ncr,
+        })
 
     def get_balance(self) -> Decimal:
         total_dr = sum((e["dr"] for e in self.entries), ZERO)
         total_cr = sum((e["cr"] for e in self.entries), ZERO)
         bal = total_dr - total_cr if self.NORMAL_BALANCES[self.account_type] == "DR" else total_cr - total_dr
         return money(bal)
+
+    def get_native_balance(self) -> Decimal:
+        """Balance in the account's own currency (what the bank statement shows)."""
+        total_dr = sum((e["ndr"] for e in self.entries), ZERO)
+        total_cr = sum((e["ncr"] for e in self.entries), ZERO)
+        bal = total_dr - total_cr if self.NORMAL_BALANCES[self.account_type] == "DR" else total_cr - total_dr
+        return quantize_native(bal, self.currency)
 
 
 class GeneralLedger(PeriodLockMixin):
@@ -280,6 +318,7 @@ class GeneralLedger(PeriodLockMixin):
         self.transactions: List[Transaction] = []
         self.category_rules: List[CategoryRule] = []
         self.period_locks = PeriodLocks()
+        self.base_currency = DEFAULT_BASE_CURRENCY  # replaced from sql_ledger_meta on load
 
         # Active connection/pending transactions used only for atomic sync
         # batches. Normal ledger operations continue to use short-lived
@@ -320,7 +359,7 @@ class GeneralLedger(PeriodLockMixin):
             # --- NEW: Enable WAL mode so readers (audit.py) don't block writers (ledger.py) ---
             cur.execute("PRAGMA journal_mode = WAL;")
 
-            cur.execute("CREATE TABLE IF NOT EXISTS sql_accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, account_type TEXT, report_line TEXT)")
+            cur.execute("CREATE TABLE IF NOT EXISTS sql_accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, account_type TEXT, report_line TEXT, currency TEXT)")
 
             cur.execute("CREATE TABLE IF NOT EXISTS sql_transactions ("
                     "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -331,7 +370,7 @@ class GeneralLedger(PeriodLockMixin):
                     "reverses_tx_id INTEGER, "
                     "change_reason TEXT)")
 
-            cur.execute("CREATE TABLE IF NOT EXISTS sql_transaction_lines (id INTEGER PRIMARY KEY AUTOINCREMENT, tx_id INTEGER, account_name TEXT, dr TEXT, cr TEXT, FOREIGN KEY(tx_id) REFERENCES sql_transactions(id))")
+            cur.execute("CREATE TABLE IF NOT EXISTS sql_transaction_lines (id INTEGER PRIMARY KEY AUTOINCREMENT, tx_id INTEGER, account_name TEXT, dr TEXT, cr TEXT, currency TEXT, orig_dr TEXT, orig_cr TEXT, fx_rate TEXT, fx_rate_date TEXT, fx_rate_source TEXT, FOREIGN KEY(tx_id) REFERENCES sql_transactions(id))")
             cur.execute("CREATE TABLE IF NOT EXISTS sql_category_rules (id INTEGER PRIMARY KEY AUTOINCREMENT, keyword TEXT, category TEXT, case_sensitive INTEGER DEFAULT 0, enabled INTEGER DEFAULT 1)")
 
             # ===================================================================
@@ -539,6 +578,32 @@ class GeneralLedger(PeriodLockMixin):
                 "data_json TEXT NOT NULL, "
                 "updated_at TEXT)"
             )
+            # ===================================================================
+            # MULTI-CURRENCY
+            # ===================================================================
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS sql_ledger_meta ("
+                "key TEXT PRIMARY KEY, "
+                "value TEXT)"
+            )
+            cur.execute(
+                "INSERT OR IGNORE INTO sql_ledger_meta (key, value) VALUES ('base_currency', ?)",
+                (DEFAULT_BASE_CURRENCY,),
+            )
+            # Reference data only. Every posted line stores the rate it used,
+            # so editing or deleting a row here never changes posted history.
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS sql_fx_rates ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "rate_date TEXT NOT NULL, "
+                "from_currency TEXT NOT NULL, "
+                "to_currency TEXT NOT NULL, "
+                "rate TEXT NOT NULL, "
+                "source TEXT NOT NULL DEFAULT 'manual', "
+                "recorded_at TEXT, "
+                "UNIQUE(rate_date, from_currency, to_currency))"
+            )
+
             cur.execute("PRAGMA table_info(sql_transactions)")
             columns = [info[1] for info in cur.fetchall()]
 
@@ -562,6 +627,16 @@ class GeneralLedger(PeriodLockMixin):
                     "source": "TEXT NOT NULL DEFAULT 'auto_detected'",
                     "updated_at": "TEXT",
                 }),
+                # Multi-currency columns, for databases created before they existed.
+                ("sql_accounts", {"currency": "TEXT"}),
+                ("sql_transaction_lines", {
+                    "currency": "TEXT",
+                    "orig_dr": "TEXT",
+                    "orig_cr": "TEXT",
+                    "fx_rate": "TEXT",
+                    "fx_rate_date": "TEXT",
+                    "fx_rate_source": "TEXT",
+                }),
             ):
                 cur.execute(f"PRAGMA table_info({_table})")
                 _existing = {info[1] for info in cur.fetchall()}
@@ -581,7 +656,11 @@ class GeneralLedger(PeriodLockMixin):
 
         conn, cur = self._connect()
         try:
-            cur.execute("SELECT name, account_type, report_line FROM sql_accounts")
+            cur.execute("SELECT value FROM sql_ledger_meta WHERE key = 'base_currency'")
+            _meta = cur.fetchone()
+            self.base_currency = _meta[0] if _meta and _meta[0] else DEFAULT_BASE_CURRENCY
+
+            cur.execute("SELECT name, account_type, report_line, currency FROM sql_accounts")
             rows = cur.fetchall()
 
             if not rows:
@@ -599,11 +678,12 @@ class GeneralLedger(PeriodLockMixin):
                         (name, acc_type, report_line),
                     )
                 conn.commit()
-                cur.execute("SELECT name, account_type, report_line FROM sql_accounts")
+                cur.execute("SELECT name, account_type, report_line, currency FROM sql_accounts")
                 rows = cur.fetchall()
 
-            for name, acc_type, report_line in rows:
-                self.accounts[name] = Account(name, acc_type, report_line)
+            for name, acc_type, report_line, acc_currency in rows:
+                # NULL currency means "follows the base currency".
+                self.accounts[name] = Account(name, acc_type, report_line, currency=acc_currency or self.base_currency)
 
             # Load EVERY transaction, voided or not -- the ledger is
             # append-only, and void_transaction() corrects a mistake by
@@ -620,8 +700,8 @@ class GeneralLedger(PeriodLockMixin):
                 "is_voided, reversed_by_tx_id, reverses_tx_id FROM sql_transactions ORDER BY date"
             )
             for tx_id, date, desc, imp_id, rec, change_reason, is_voided, reversed_by, reverses in cur.fetchall():
-                cur.execute("SELECT id, account_name, dr, cr FROM sql_transaction_lines WHERE tx_id = ?", (tx_id,))
-                lines = [TransactionLine(acc_name, money(dr) if dr else ZERO, money(cr) if cr else ZERO, id=line_id) for line_id, acc_name, dr, cr in cur.fetchall()]
+                cur.execute(self._LINE_SELECT_SQL, (tx_id,))
+                lines = [self._line_from_row(r) for r in cur.fetchall()]
                 tx = Transaction(tx_id, date, desc, lines, imp_id, bool(rec), change_reason,
                                   is_voided=bool(is_voided), reversed_by_tx_id=reversed_by, reverses_tx_id=reverses)
                 self._apply_transaction_to_accounts(tx)
@@ -754,20 +834,26 @@ class GeneralLedger(PeriodLockMixin):
 
     def _apply_transaction_to_accounts(self, tx: Transaction):
         for line in tx.lines:
-            self.accounts[line.account_name].add_entry(tx.date, tx.description, line.dr, line.cr)
+            self.accounts[line.account_name].add_entry(
+                tx.date, tx.description, line.dr, line.cr, line.native_dr, line.native_cr
+            )
 
-    def create_account(self, name: str, acc_type: str, report_line: Optional[str] = None) -> Tuple[bool, str]:
+    def create_account(self, name: str, acc_type: str, report_line: Optional[str] = None,
+                       currency: Optional[str] = None) -> Tuple[bool, str]:
+        """currency=None (or the base currency) creates a base-currency account."""
         if name in self.accounts:
             return False, "Account already exists."
         try:
-            new_account = Account(name, acc_type, report_line)  # validates acc_type and report_line together
+            code = normalize_currency(currency) if currency else self.base_currency
+            new_account = Account(name, acc_type, report_line, currency=code)  # validates acc_type and report_line together
         except ValueError as e:
             return False, str(e)
+        stored_currency = None if code == self.base_currency else code
         conn, cur = self._connect()
         try:
             cur.execute(
-                "INSERT INTO sql_accounts (name, account_type, report_line) VALUES (?, ?, ?)",
-                (name, acc_type, report_line),
+                "INSERT INTO sql_accounts (name, account_type, report_line, currency) VALUES (?, ?, ?, ?)",
+                (name, acc_type, report_line, stored_currency),
             )
             conn.commit()
             self.accounts[name] = new_account
@@ -958,7 +1044,10 @@ class GeneralLedger(PeriodLockMixin):
             return False, msg
 
         try:
-            lines = [TransactionLine(acc, money(dr), money(cr)) for acc, dr, cr in lines_data]
+            lines = []
+            for acc, dr, cr, *_rest in lines_data:
+                # Optional 4th element: FxInfo for a line posted to a foreign-currency account.
+                lines.append(TransactionLine(acc, money(dr), money(cr), fx=_rest[0] if _rest else None))
             for line in lines:
                 if not line.dr.is_finite() or not line.cr.is_finite():
                     raise ValueError(f"non-finite amount on account '{line.account_name}'")
@@ -992,6 +1081,10 @@ class GeneralLedger(PeriodLockMixin):
                 msg = f"Missing account: {line.account_name}"
                 logger.warning(f"Ledger rejected transaction '{description}': {msg}")
                 return False, msg
+            fx_msg = self._validate_fx_line(line)
+            if fx_msg:
+                logger.warning(f"Ledger rejected transaction '{description}': {fx_msg}")
+                return False, fx_msg
 
         total_dr = sum((l.dr for l in lines), ZERO)
         total_cr = sum((l.cr for l in lines), ZERO)
@@ -1039,15 +1132,62 @@ class GeneralLedger(PeriodLockMixin):
         entries can document WHICH specific line changed in a
         multi-line/split transaction, not just that the transaction
         changed somehow.
+
+        Foreign-currency lines also carry their FX detail. Base-currency
+        lines serialize exactly as they always did.
         """
         payload = []
         for line in lines:
             if isinstance(line, TransactionLine):
-                payload.append({"id": line.id, "account_name": line.account_name, "dr": str(line.dr), "cr": str(line.cr)})
+                item = {"id": line.id, "account_name": line.account_name, "dr": str(line.dr), "cr": str(line.cr)}
+                if line.fx is not None:
+                    item.update({
+                        "ccy": line.fx.currency,
+                        "orig_dr": str(line.native_dr),
+                        "orig_cr": str(line.native_cr),
+                        "rate": format(line.fx.rate, "f"),
+                        "rate_date": line.fx.rate_date,
+                        "rate_src": line.fx.rate_source,
+                    })
+                payload.append(item)
             else:
                 line_id, acc, dr, cr = line
                 payload.append({"id": line_id, "account_name": acc, "dr": str(money(dr)), "cr": str(money(cr))})
         return json.dumps(payload)
+
+    # --- line row helpers (single place that knows the column order) ---
+
+    _LINE_SELECT_SQL = (
+        "SELECT id, account_name, dr, cr, currency, orig_dr, orig_cr, fx_rate, fx_rate_date, fx_rate_source "
+        "FROM sql_transaction_lines WHERE tx_id = ?"
+    )
+    _LINE_INSERT_SQL = (
+        "INSERT INTO sql_transaction_lines "
+        "(tx_id, account_name, dr, cr, currency, orig_dr, orig_cr, fx_rate, fx_rate_date, fx_rate_source) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+
+    @staticmethod
+    def _line_params(tx_id: int, line: TransactionLine) -> tuple:
+        fx = line.fx
+        if fx is None:
+            return (tx_id, line.account_name, str(line.dr), str(line.cr), None, None, None, None, None, None)
+        return (
+            tx_id, line.account_name, str(line.dr), str(line.cr),
+            fx.currency, str(line.native_dr), str(line.native_cr),
+            format(fx.rate, "f"), fx.rate_date, fx.rate_source,
+        )
+
+    @staticmethod
+    def _line_from_row(row) -> TransactionLine:
+        line_id, acc_name, dr, cr, ccy, orig_dr, orig_cr, rate, rate_date, rate_source = row
+        dr_m = money(dr) if dr else ZERO
+        cr_m = money(cr) if cr else ZERO
+        fx = None
+        if ccy:
+            native = Decimal(orig_dr) if dr_m > ZERO else Decimal(orig_cr)
+            fx = FxInfo(ccy, native, Decimal(rate), rate_date, rate_source or "manual")
+        return TransactionLine(acc_name, dr_m, cr_m, id=line_id, fx=fx)
 
     def _log_history(self, cur, tx_id: Optional[int], change_type: str, date: str, description: str, lines, change_reason: Optional[str] = None) -> None:
         """
@@ -1083,14 +1223,14 @@ class GeneralLedger(PeriodLockMixin):
 
     def _fetch_transaction_snapshot(self, cur, tx_id: int):
         """Read a transaction's current (date, description, lines) directly
-        from the DB. lines is a list of (line_id, account_name, dr, cr)."""
+        from the DB. lines is a list of TransactionLine (with fx, if any)."""
         cur.execute("SELECT date, description FROM sql_transactions WHERE id = ?", (tx_id,))
         row = cur.fetchone()
         if row is None:
             return None
         date, description = row
-        cur.execute("SELECT id, account_name, dr, cr FROM sql_transaction_lines WHERE tx_id = ?", (tx_id,))
-        lines = [(line_id, acc, money(dr) if dr else ZERO, money(cr) if cr else ZERO) for line_id, acc, dr, cr in cur.fetchall()]
+        cur.execute(self._LINE_SELECT_SQL, (tx_id,))
+        lines = [self._line_from_row(r) for r in cur.fetchall()]
         return date, description, lines
 
     def _persist_transaction(self, tx: Transaction):
@@ -1107,10 +1247,7 @@ class GeneralLedger(PeriodLockMixin):
             tx_id = cur.lastrowid
             tx.id = tx_id
             for line in tx.lines:
-                cur.execute(
-                    "INSERT INTO sql_transaction_lines (tx_id, account_name, dr, cr) VALUES (?, ?, ?, ?)",
-                    (tx_id, line.account_name, str(line.dr), str(line.cr)),
-                )
+                cur.execute(self._LINE_INSERT_SQL, self._line_params(tx_id, line))
                 line.id = cur.lastrowid
             self._log_history(cur, tx_id, "created", tx.date, tx.description, tx.lines)
             return
@@ -1124,10 +1261,7 @@ class GeneralLedger(PeriodLockMixin):
             tx_id = cur.lastrowid
             tx.id = tx_id
             for line in tx.lines:
-                cur.execute(
-                    "INSERT INTO sql_transaction_lines (tx_id, account_name, dr, cr) VALUES (?, ?, ?, ?)",
-                    (tx_id, line.account_name, str(line.dr), str(line.cr)),
-                )
+                cur.execute(self._LINE_INSERT_SQL, self._line_params(tx_id, line))
                 line.id = cur.lastrowid
             self._log_history(cur, tx_id, "created", tx.date, tx.description, tx.lines)
             conn.commit()
@@ -1661,10 +1795,27 @@ class GeneralLedger(PeriodLockMixin):
                     dr = money(dr_str) if dr_str.strip() else ZERO
                     cr = money(cr_str) if cr_str.strip() else ZERO
                     acc_type = acc_type.strip().capitalize()
+
+                    # Optional multi-currency columns (files exported before v1.3 have none).
+                    cell = lambda i: row[i].strip() if len(row) > i else ""
+                    file_base = cell(12).upper()
+                    if file_base and file_base != self.base_currency:
+                        raise ValueError(
+                            f"This file's amounts are in {file_base}, but this ledger's base currency is "
+                            f"{self.base_currency}. Importing would mislabel every amount."
+                        )
+                    line_ccy = cell(6).upper()
+                    fx = None
+                    if line_ccy and line_ccy != self.base_currency:
+                        line_ccy = normalize_currency(line_ccy)
+                        native = parse_decimal(cell(7) if dr > ZERO else cell(8), "native amount")
+                        fx = FxInfo(line_ccy, native, parse_decimal(cell(9), "FX rate"),
+                                    cell(10) or date, cell(11) or "manual")
                     if acc_name not in self.accounts:
-                        cur.execute("INSERT OR IGNORE INTO sql_accounts (name, account_type) VALUES (?, ?)", (acc_name, acc_type))
-                        self.accounts[acc_name] = Account(acc_name, acc_type)
-                    tx_groups.setdefault((date, desc), []).append((acc_name, dr, cr))
+                        cur.execute("INSERT OR IGNORE INTO sql_accounts (name, account_type, currency) VALUES (?, ?, ?)",
+                                    (acc_name, acc_type, line_ccy if fx else None))
+                        self.accounts[acc_name] = Account(acc_name, acc_type, currency=line_ccy if fx else self.base_currency)
+                    tx_groups.setdefault((date, desc), []).append((acc_name, dr, cr, fx))
             conn.commit()
         except Exception:
             conn.rollback()
@@ -1808,6 +1959,7 @@ class GeneralLedger(PeriodLockMixin):
         rows = []
         for tx in self.transactions:
             for line in tx.lines:
+                fx = line.fx
                 rows.append([
                     _sanitize_for_csv(tx.date),
                     _sanitize_for_csv(tx.description),
@@ -1815,10 +1967,21 @@ class GeneralLedger(PeriodLockMixin):
                     _sanitize_for_csv(self.accounts[line.account_name].account_type),
                     line.dr if line.dr > ZERO else "",
                     line.cr if line.cr > ZERO else "",
+                    # Multi-currency columns (blank for base-currency lines).
+                    # Debit/Credit above are always BASE amounts.
+                    fx.currency if fx else "",
+                    line.native_dr if fx and line.dr > ZERO else "",
+                    line.native_cr if fx and line.cr > ZERO else "",
+                    format(fx.rate, "f") if fx else "",
+                    fx.rate_date if fx else "",
+                    _sanitize_for_csv(fx.rate_source) if fx else "",
+                    self.base_currency,
                 ])
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["Date", "Description", "Account Name", "Account Type", "Debit ($)", "Credit ($)"])
+            w.writerow(["Date", "Description", "Account Name", "Account Type", "Debit (base)", "Credit (base)",
+                        "Currency", "Native Debit", "Native Credit", "FX Rate", "FX Rate Date",
+                        "FX Rate Source", "Base Currency"])
             w.writerows(rows)
 
     def add_category_rule(self, keyword: str, category: str, case_sensitive: bool = False, enabled: bool = True) -> Tuple[bool, str]:
@@ -3169,12 +3332,291 @@ class GeneralLedger(PeriodLockMixin):
                     total_cr += line.cr
         return money(total_dr), money(total_cr)
 
-    def post_simple_transaction(self, date: str, description: str, credit_account: str, debit_account: str, amount: Any) -> Tuple[bool, str]:
+    # ---------------- Multi-currency ----------------
+    #
+    # Model: every line's dr/cr is a BASE-currency amount. A line posted to a
+    # foreign-currency account additionally carries an FxInfo (native amount,
+    # rate, rate date, rate source). Rates are looked up ONCE, at posting
+    # time, and stored on the line -- historical entries never re-price.
+
+    def get_base_currency(self) -> str:
+        return self.base_currency
+
+    def set_base_currency(self, code: str) -> Tuple[bool, str]:
+        """Only allowed while the ledger has no transactions (first-run setup)."""
+        try:
+            code = normalize_currency(code)
+        except ValueError as e:
+            return False, str(e)
+        if code == self.base_currency:
+            return True, f"Base currency is already {code}."
+        if self.transactions:
+            return False, "The base currency can't be changed once transactions exist."
+        conn, cur = self._connect()
+        try:
+            cur.execute(
+                "INSERT INTO sql_ledger_meta (key, value) VALUES ('base_currency', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (code,),
+            )
+            # Accounts that were explicitly in the new base now simply follow it.
+            cur.execute("UPDATE sql_accounts SET currency = NULL WHERE currency = ?", (code,))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+        finally:
+            conn.close()
+        self._load_from_db()
+        return True, f"Base currency set to {code}."
+
+    def get_account_currency(self, account_name: str) -> str:
+        if account_name not in self.accounts:
+            raise ValueError(f"Account '{account_name}' does not exist.")
+        return self.accounts[account_name].currency
+
+    def set_account_currency(self, name: str, currency: str) -> Tuple[bool, str]:
+        if name not in self.accounts:
+            return False, "Account does not exist."
+        try:
+            code = normalize_currency(currency)
+        except ValueError as e:
+            return False, str(e)
+        acc = self.accounts[name]
+        if code == acc.currency:
+            return True, "No changes made."
+        if acc.entries:
+            return False, "Can't change the currency of an account that already has transactions."
+        conn, cur = self._connect()
+        try:
+            cur.execute("UPDATE sql_accounts SET currency = ? WHERE name = ?",
+                        (None if code == self.base_currency else code, name))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+        finally:
+            conn.close()
+        acc.currency = code
+        return True, f"Account '{name}' is now in {code}."
+
+    def _is_foreign_account(self, account_name: str) -> bool:
+        return self.accounts[account_name].currency != self.base_currency
+
+    # --- rate table ---
+
+    def set_fx_rate(self, rate_date: str, from_currency: str, to_currency: str, rate: Any,
+                    source: str = "manual") -> Tuple[bool, str]:
+        """Record (or replace) the rate for one day. rate = to_currency units per 1 from_currency."""
+        try:
+            datetime.strptime(rate_date, "%Y-%m-%d")
+            f, tcode = normalize_currency(from_currency), normalize_currency(to_currency)
+            if f == tcode:
+                return False, "From and to currencies must differ."
+            r = quantize_rate(parse_decimal(rate, "rate"))
+            if r <= 0:
+                return False, "Rate must be greater than zero."
+        except (ValueError, TypeError) as e:
+            return False, str(e) if str(e) else "Invalid date. Use YYYY-MM-DD."
+        conn, cur = self._connect()
+        try:
+            cur.execute(
+                "INSERT INTO sql_fx_rates (rate_date, from_currency, to_currency, rate, source, recorded_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(rate_date, from_currency, to_currency) DO UPDATE SET "
+                "rate = excluded.rate, source = excluded.source, recorded_at = excluded.recorded_at",
+                (rate_date, f, tcode, format(r, "f"), source or "manual", datetime.now().isoformat(timespec="seconds")),
+            )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+        finally:
+            conn.close()
+        return True, f"Rate saved: 1 {f} = {format(r, 'f')} {tcode} on {rate_date}."
+
+    def delete_fx_rate(self, rate_date: str, from_currency: str, to_currency: str) -> Tuple[bool, str]:
+        """Safe for history: posted lines keep their own copy of the rate they used."""
+        conn, cur = self._connect()
+        try:
+            cur.execute(
+                "DELETE FROM sql_fx_rates WHERE rate_date = ? AND from_currency = ? AND to_currency = ?",
+                (rate_date, from_currency.strip().upper(), to_currency.strip().upper()),
+            )
+            if cur.rowcount == 0:
+                return False, "Rate not found."
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+        finally:
+            conn.close()
+        return True, "Rate deleted."
+
+    def list_fx_rates(self, from_currency: Optional[str] = None, to_currency: Optional[str] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT rate_date, from_currency, to_currency, rate, source FROM sql_fx_rates"
+        where, params = [], []
+        if from_currency:
+            where.append("from_currency = ?")
+            params.append(from_currency.strip().upper())
+        if to_currency:
+            where.append("to_currency = ?")
+            params.append(to_currency.strip().upper())
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY rate_date DESC, from_currency, to_currency"
+        conn, cur = self._connect()
+        try:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+        return [{"rate_date": r[0], "from_currency": r[1], "to_currency": r[2],
+                 "rate": Decimal(r[3]), "source": r[4]} for r in rows]
+
+    def get_fx_rate(self, from_currency: str, to_currency: str, on_date: str) -> Optional[FxRate]:
+        """
+        Nearest rate on or before on_date. Uses the direct pair if present,
+        else the inverse pair (1/rate), preferring whichever is more recent.
+        Returns None when nothing on or before that date exists.
+        """
+        f, tcode = normalize_currency(from_currency), normalize_currency(to_currency)
+        if f == tcode:
+            return FxRate(Decimal(1), on_date, "identity")
+        sql = ("SELECT rate_date, rate, source FROM sql_fx_rates "
+               "WHERE from_currency = ? AND to_currency = ? AND rate_date <= ? "
+               "ORDER BY rate_date DESC LIMIT 1")
+        conn, cur = self._connect()
+        try:
+            cur.execute(sql, (f, tcode, on_date))
+            direct = cur.fetchone()
+            cur.execute(sql, (tcode, f, on_date))
+            inverse = cur.fetchone()
+        finally:
+            conn.close()
+        if direct and (not inverse or direct[0] >= inverse[0]):
+            return FxRate(Decimal(direct[1]), direct[0], direct[2], False)
+        if inverse:
+            return FxRate(quantize_rate(Decimal(1) / Decimal(inverse[1])), inverse[0], inverse[2], True)
+        return None
+
+    # --- conversion ---
+
+    @staticmethod
+    def _check_date(on_date: str) -> None:
+        try:
+            datetime.strptime(on_date, "%Y-%m-%d")
+        except (ValueError, TypeError):
+            raise ValueError("Invalid date format. Use YYYY-MM-DD.")
+
+    def _lookup_rate(self, currency: str, on_date: str, rate: Any = None,
+                     rate_source: Optional[str] = None) -> Tuple[Decimal, str, str]:
+        """(rate, rate_date, source) for currency -> base. An explicit rate wins over the table."""
+        if rate is not None:
+            r = quantize_rate(parse_decimal(rate, "rate"))
+            if r <= 0:
+                raise ValueError("Rate must be greater than zero.")
+            return r, on_date, rate_source or "manual"
+        found = self.get_fx_rate(currency, self.base_currency, on_date)
+        if found is None:
+            raise ValueError(
+                f"No {currency}->{self.base_currency} rate on or before {on_date}. "
+                "Add one with set_fx_rate() or pass rate=."
+            )
+        return found.rate, found.rate_date, found.source + (" (inverse)" if found.inverted else "")
+
+    def convert_to_base(self, account_name: str, native_amount: Any, on_date: str, rate: Any = None,
+                        rate_source: Optional[str] = None) -> Tuple[Decimal, FxInfo]:
+        """
+        Convert an amount in a foreign-currency account's own currency into base.
+        Returns (base_amount, FxInfo) ready to use as a line in record_transaction().
+        Raises ValueError (no rate, bad amount, base-currency account, ...).
+        """
+        if account_name not in self.accounts:
+            raise ValueError(f"Account '{account_name}' does not exist.")
+        acc = self.accounts[account_name]
+        if acc.currency == self.base_currency:
+            raise ValueError(f"Account '{account_name}' is in the base currency ({self.base_currency}).")
+        self._check_date(on_date)
+        native = quantize_native(parse_decimal(native_amount, "amount"), acc.currency)
+        if native <= 0:
+            raise ValueError("Amount must be greater than zero.")
+        r, r_date, src = self._lookup_rate(acc.currency, on_date, rate, rate_source)
+        return to_base(native, r), FxInfo(acc.currency, native, r, r_date, src)
+
+    def _validate_fx_line(self, line: TransactionLine) -> Optional[str]:
+        """
+        Enforce the FX invariants for one line (account must already exist).
+        Returns an error message, or None. May normalise line.fx in place
+        (quantised native amount and rate).
+        """
+        acc = self.accounts[line.account_name]
+        foreign = acc.currency != self.base_currency
+        fx = line.fx
+        if not foreign:
+            if fx is not None:
+                return (f"Account '{line.account_name}' is in the base currency ({self.base_currency}); "
+                        "its lines must not carry FX information.")
+            return None
+        if fx is None:
+            return (f"Account '{line.account_name}' is in {acc.currency}. Supply the native amount and rate "
+                    "(see convert_to_base() / transfer_funds()).")
+        try:
+            code = normalize_currency(fx.currency)
+            if code != acc.currency:
+                return f"Line currency {code} doesn't match account '{line.account_name}' ({acc.currency})."
+            native = quantize_native(parse_decimal(fx.native, "native amount"), code)
+            rate = quantize_rate(parse_decimal(fx.rate, "rate"))
+            datetime.strptime(fx.rate_date, "%Y-%m-%d")
+        except (ValueError, TypeError) as e:
+            return f"Invalid FX information on '{line.account_name}': {e}"
+        if native <= 0 or rate <= 0:
+            return f"Native amount and rate must be greater than zero on '{line.account_name}'."
+        base_amt = line.dr if line.dr > ZERO else line.cr
+        expected = to_base(native, rate)
+        if abs(expected - base_amt) > fx_tolerance(native, rate, code):
+            return (f"On '{line.account_name}': {native} {code} x {rate} = {expected} {self.base_currency}, "
+                    f"but the line's base amount is {base_amt}.")
+        line.fx = FxInfo(code, native, rate, fx.rate_date, fx.rate_source or "manual")
+        return None
+
+    # --- posting ---
+
+    def post_simple_transaction(self, date: str, description: str, credit_account: str, debit_account: str,
+                                amount: Any, rate: Any = None, rate_source: Optional[str] = None) -> Tuple[bool, str]:
+        """
+        Two-line posting. For base-currency accounts `amount` is in base, exactly as before.
+        If ONE of the two accounts is foreign, `amount` is in THAT account's currency and is
+        converted at `rate` (or the rate table's nearest-prior rate for `date`).
+        If both are foreign, use transfer_funds().
+        """
         if credit_account not in self.accounts or debit_account not in self.accounts:
             return False, "One or both accounts do not exist."
 
         if debit_account == credit_account:
             return False, "Debit and credit accounts must be different."
+
+        cr_foreign = self._is_foreign_account(credit_account)
+        dr_foreign = self._is_foreign_account(debit_account)
+
+        if cr_foreign and dr_foreign:
+            return False, "Both accounts are in foreign currencies; use transfer_funds()."
+
+        if cr_foreign or dr_foreign:
+            fx_account = credit_account if cr_foreign else debit_account
+            try:
+                base_amt, fx = self.convert_to_base(fx_account, amount, date, rate, rate_source)
+            except ValueError as e:
+                return False, str(e)
+            return self.record_transaction(
+                date,
+                description,
+                [
+                    (credit_account, ZERO, base_amt, fx if cr_foreign else None),
+                    (debit_account, base_amt, ZERO, fx if dr_foreign else None),
+                ],
+                persist=True
+            )
 
         m_amount = money(amount)
         return self.record_transaction(
@@ -3187,13 +3629,91 @@ class GeneralLedger(PeriodLockMixin):
             persist=True
         )
 
-    def transfer_funds(self, date: str, description: str, from_account: str, to_account: str, amount: Any) -> Tuple[bool, str]:
-        return self.post_simple_transaction(
-            date=date,
-            description=description,
-            credit_account=from_account,
-            debit_account=to_account,
-            amount=amount
+    def transfer_funds(self, date: str, description: str, from_account: str, to_account: str, amount: Any,
+                       to_amount: Any = None, rate: Any = None, rate_source: Optional[str] = None,
+                       to_rate: Any = None) -> Tuple[bool, str]:
+        """
+        Move money between accounts. Two base-currency accounts behave exactly as before.
+
+        Otherwise `amount` is in the FROM account's currency and the entry always balances in base:
+          * The sending leg is valued in base at `rate` (or the rate table). For a foreign->base
+            transfer you may instead pass `to_amount` = the base amount actually received; the
+            sending leg's rate is then implied (don't also pass `rate`).
+          * The receiving leg takes that same base value. If the receiving account is foreign,
+            pass `to_amount` = what actually landed in its currency (rate implied), or leave it
+            out to derive it from `to_rate` / the rate table.
+        Any gap between the implied rate and a market rate is an FX gain/loss, handled in a later phase.
+        """
+        if from_account not in self.accounts or to_account not in self.accounts:
+            return False, "One or both accounts do not exist."
+        if from_account == to_account:
+            return False, "Debit and credit accounts must be different."
+
+        from_foreign = self._is_foreign_account(from_account)
+        to_foreign = self._is_foreign_account(to_account)
+        if not from_foreign and not to_foreign:
+            return self.post_simple_transaction(
+                date=date,
+                description=description,
+                credit_account=from_account,
+                debit_account=to_account,
+                amount=amount
+            )
+
+        try:
+            self._check_date(date)
+            cur_from = self.accounts[from_account].currency
+            cur_to = self.accounts[to_account].currency
+
+            # 1. What leaves the sending account, valued in base.
+            if from_foreign:
+                if to_amount is not None and not to_foreign:
+                    if rate is not None:
+                        raise ValueError("Give either rate or to_amount for a transfer into a base-currency "
+                                         "account, not both.")
+                    base_value = money(parse_decimal(to_amount, "to_amount"))
+                    native_out = quantize_native(parse_decimal(amount, "amount"), cur_from)
+                    if base_value <= 0 or native_out <= 0:
+                        raise ValueError("Amounts must be greater than zero.")
+                    fx_from = FxInfo(cur_from, native_out, derive_rate(base_value, native_out), date,
+                                     "implied by transfer")
+                else:
+                    base_value, fx_from = self.convert_to_base(from_account, amount, date, rate, rate_source)
+            else:
+                base_value = money(parse_decimal(amount, "amount"))
+                if base_value <= 0:
+                    raise ValueError("Amount must be greater than zero.")
+                fx_from = None
+
+            # 2. What arrives, in the receiving account's own currency.
+            fx_to = None
+            if to_foreign:
+                if to_amount is not None:
+                    native_in = quantize_native(parse_decimal(to_amount, "to_amount"), cur_to)
+                    if native_in <= 0:
+                        raise ValueError("Amounts must be greater than zero.")
+                    fx_to = FxInfo(cur_to, native_in, derive_rate(base_value, native_in), date,
+                                   "implied by transfer")
+                elif from_foreign and cur_from == cur_to and to_rate is None:
+                    # Same-currency move between two foreign accounts: nothing converts.
+                    fx_to = FxInfo(cur_to, fx_from.native, fx_from.rate, fx_from.rate_date, fx_from.rate_source)
+                else:
+                    r, r_date, src = self._lookup_rate(cur_to, date, to_rate, rate_source)
+                    native_in = quantize_native(base_value / r, cur_to)
+                    if native_in <= 0:
+                        raise ValueError("Amounts must be greater than zero.")
+                    fx_to = FxInfo(cur_to, native_in, r, r_date, src)
+        except ValueError as e:
+            return False, str(e)
+
+        return self.record_transaction(
+            date,
+            description,
+            [
+                (from_account, ZERO, base_value, fx_from),
+                (to_account, base_value, ZERO, fx_to),
+            ],
+            persist=True
         )
 
     def _investment_crypto_lock_message(self, tx_id: int) -> Optional[str]:
@@ -3232,6 +3752,10 @@ class GeneralLedger(PeriodLockMixin):
         """
         APPEND-ONLY DELETE: Voids the original transaction by creating a
         perfect reversal (flipping DR/CR) and marking the original as voided.
+
+        Foreign-currency lines are reversed with the SAME native amount and
+        the SAME rate as the original, so the reversal cancels it exactly
+        in both base and native terms regardless of where rates have moved.
         """
 
         guard_msg = self._investment_crypto_lock_message(tx_id)
@@ -3254,11 +3778,11 @@ class GeneralLedger(PeriodLockMixin):
             if reconciled:
                 return False, "Cannot void a reconciled transaction. Unreconcile it first."
 
-            cur.execute("SELECT id, account_name, dr, cr FROM sql_transaction_lines WHERE tx_id = ?", (tx_id,))
-            old_lines = [(lid, acc, money(dr) if dr else ZERO, money(cr) if cr else ZERO) for lid, acc, dr, cr in cur.fetchall()]
+            cur.execute(self._LINE_SELECT_SQL, (tx_id,))
+            old_lines = [self._line_from_row(r) for r in cur.fetchall()]
 
             # 2. Create the reversal transaction (flip DR and CR)
-            reversal_lines = [(None, acc, cr, dr) for _, acc, dr, cr in old_lines]
+            reversal_lines = [TransactionLine(l.account_name, l.cr, l.dr, fx=l.fx) for l in old_lines]
             reversal_desc = f"VOID: {old_desc}"
 
             cur.execute(
@@ -3268,11 +3792,8 @@ class GeneralLedger(PeriodLockMixin):
             )
             new_tx_id = cur.lastrowid
 
-            for _, acc, dr, cr in reversal_lines:
-                cur.execute(
-                    "INSERT INTO sql_transaction_lines (tx_id, account_name, dr, cr) VALUES (?, ?, ?, ?)",
-                    (new_tx_id, acc, str(dr), str(cr))
-                )
+            for line in reversal_lines:
+                cur.execute(self._LINE_INSERT_SQL, self._line_params(new_tx_id, line))
 
             # 3. Mark original as voided
             cur.execute("UPDATE sql_transactions SET is_voided = 1, reversed_by_tx_id = ? WHERE id = ?", (new_tx_id, tx_id))
@@ -3291,10 +3812,13 @@ class GeneralLedger(PeriodLockMixin):
         self._load_from_db()
         return True, "Transaction voided and reversed."
 
-    def edit_transaction(self, tx_id: int, new_date: str, new_description: str, new_lines: List[Tuple[Optional[int], str, Any, Any]], reason: Optional[str] = None) -> Tuple[bool, str]:
+    def edit_transaction(self, tx_id: int, new_date: str, new_description: str, new_lines: List[tuple], reason: Optional[str] = None) -> Tuple[bool, str]:
         """
         APPEND-ONLY EDIT: Voids the original transaction and creates a brand new
         one with the updated details. Preserves the immutable audit trail.
+
+        new_lines items are (line_id, account, dr, cr) or, for a line on a
+        foreign-currency account, (line_id, account, dr, cr, FxInfo).
         """
         guard_msg = self._investment_crypto_lock_message(tx_id)
         if guard_msg:
@@ -3304,28 +3828,31 @@ class GeneralLedger(PeriodLockMixin):
         if len(new_lines) < 2:
             return False, "A transaction must contain at least two lines."
 
-        parsed = []
+        parsed: List[TransactionLine] = []
         try:
-            for line_id, acc, dr, cr in new_lines:
+            for line_id, acc, dr, cr, *_rest in new_lines:
                 dr_val, cr_val = money(dr), money(cr)
                 if not dr_val.is_finite() or not cr_val.is_finite():
                     raise ValueError(f"non-finite amount on account '{acc}'")
-                parsed.append((acc, dr_val, cr_val)) # We strip line_id for the new insert
+                # We strip line_id for the new insert
+                parsed.append(TransactionLine(acc, dr_val, cr_val, fx=_rest[0] if _rest else None))
         except (InvalidOperation, ValueError, TypeError) as e:
             return False, f"Invalid amount: {e}"
 
-        for acc, dr, cr in parsed:
-            if dr < ZERO or cr < ZERO: return False, "Negative amounts not allowed."
-            if dr > ZERO and cr > ZERO: return False, "Line cannot have both DR and CR."
-            if dr == ZERO and cr == ZERO: return False, "Line must have DR or CR."
-            if acc not in self.accounts: return False, f"Account '{acc}' does not exist."
+        for line in parsed:
+            if line.dr < ZERO or line.cr < ZERO: return False, "Negative amounts not allowed."
+            if line.dr > ZERO and line.cr > ZERO: return False, "Line cannot have both DR and CR."
+            if line.dr == ZERO and line.cr == ZERO: return False, "Line must have DR or CR."
+            if line.account_name not in self.accounts: return False, f"Account '{line.account_name}' does not exist."
+            fx_msg = self._validate_fx_line(line)
+            if fx_msg: return False, fx_msg
 
-        total_dr = sum((dr for _, dr, _ in parsed), ZERO)
-        total_cr = sum((cr for _, _, cr in parsed), ZERO)
+        total_dr = sum((l.dr for l in parsed), ZERO)
+        total_cr = sum((l.cr for l in parsed), ZERO)
         if total_dr != total_cr:
             return False, "Transaction out of balance."
 
-        lock_msg = self.period_lock_violation(new_date, [acc for acc, _, _ in parsed])
+        lock_msg = self.period_lock_violation(new_date, [l.account_name for l in parsed])
         if lock_msg:
             return False, lock_msg
 
@@ -3346,8 +3873,8 @@ class GeneralLedger(PeriodLockMixin):
             if reconciled:
                 return False, "Cannot edit a reconciled transaction. Unreconcile it first."
 
-            cur.execute("SELECT id, account_name, dr, cr FROM sql_transaction_lines WHERE tx_id = ?", (tx_id,))
-            old_lines = [(lid, acc, money(dr) if dr else ZERO, money(cr) if cr else ZERO) for lid, acc, dr, cr in cur.fetchall()]
+            cur.execute(self._LINE_SELECT_SQL, (tx_id,))
+            old_lines = [self._line_from_row(r) for r in cur.fetchall()]
 
             # 3. Reverse the original with an explicit, fully-counted
             # entry -- the ledger never excludes a posted transaction
@@ -3356,19 +3883,17 @@ class GeneralLedger(PeriodLockMixin):
             # a balance gate -- without this explicit reversal, the
             # original's dollar effect would stay fully counted AND the
             # new corrected transaction below would also count,
-            # double-posting the change.
-            reversal_lines = [(acc, cr, dr) for _, acc, dr, cr in old_lines]
+            # double-posting the change. Foreign lines reverse at their
+            # original native amount and rate.
+            reversal_lines = [TransactionLine(l.account_name, l.cr, l.dr, fx=l.fx) for l in old_lines]
             cur.execute(
                 "INSERT INTO sql_transactions (date, description, imported_id, reconciled, is_voided, reverses_tx_id, change_reason) "
                 "VALUES (?, ?, NULL, 0, 0, ?, ?)",
                 (old_date, f"Reversal (edited): {old_desc}", tx_id, reason)
             )
             reversal_tx_id = cur.lastrowid
-            for acc, dr, cr in reversal_lines:
-                cur.execute(
-                    "INSERT INTO sql_transaction_lines (tx_id, account_name, dr, cr) VALUES (?, ?, ?, ?)",
-                    (reversal_tx_id, acc, str(dr), str(cr))
-                )
+            for line in reversal_lines:
+                cur.execute(self._LINE_INSERT_SQL, self._line_params(reversal_tx_id, line))
             cur.execute("UPDATE sql_transactions SET is_voided = 1, reversed_by_tx_id = ? WHERE id = ?", (reversal_tx_id, tx_id))
 
             # 4. Insert new transaction (the corrected version)
@@ -3379,17 +3904,13 @@ class GeneralLedger(PeriodLockMixin):
             )
             new_tx_id = cur.lastrowid
 
-            for acc, dr, cr in parsed:
-                cur.execute(
-                    "INSERT INTO sql_transaction_lines (tx_id, account_name, dr, cr) VALUES (?, ?, ?, ?)",
-                    (new_tx_id, acc, str(dr), str(cr))
-                )
+            for line in parsed:
+                cur.execute(self._LINE_INSERT_SQL, self._line_params(new_tx_id, line))
 
             # 5. Log to history
             self._log_history(cur, tx_id, "voided", old_date, old_desc, old_lines)
-            self._log_history(cur, reversal_tx_id, "created", old_date, f"Reversal (edited): {old_desc}",
-                               [(None, acc, dr, cr) for acc, dr, cr in reversal_lines])
-            self._log_history(cur, new_tx_id, "created", new_date, new_description, [(None, acc, dr, cr) for acc, dr, cr in parsed], change_reason=reason)
+            self._log_history(cur, reversal_tx_id, "created", old_date, f"Reversal (edited): {old_desc}", reversal_lines)
+            self._log_history(cur, new_tx_id, "created", new_date, new_description, parsed, change_reason=reason)
 
             conn.commit()
         except Exception as e:
@@ -3492,6 +4013,13 @@ class GeneralLedger(PeriodLockMixin):
             return False, f"Account '{new_account}' does not exist."
         if old_account == new_account:
             return False, "Old and new account are the same; nothing to do."
+        _old_acc = self.accounts.get(old_account)
+        if _old_acc is not None and _old_acc.currency != self.accounts[new_account].currency:
+            return False, (
+                f"'{old_account}' is in {_old_acc.currency} but '{new_account}' is in "
+                f"{self.accounts[new_account].currency}. Lines can't be relabelled across currencies; "
+                "void and re-post them instead."
+            )
 
         conn, cur = self._connect()
         try:
@@ -3525,7 +4053,7 @@ class GeneralLedger(PeriodLockMixin):
                 if snap is None:
                     continue
                 snap_date, _, snap_lines = snap
-                accs = {acc for _, acc, _, _ in snap_lines} | {new_account}
+                accs = {l.account_name for l in snap_lines} | {new_account}
                 if self.period_lock_violation(snap_date, accs):
                     blocked += 1
             if blocked:
@@ -3886,7 +4414,7 @@ class GeneralLedger(PeriodLockMixin):
             conn.close()
         return [self._history_row_to_dict(r) for r in rows]
 
-    def cleared_balance_as_of(self, account_name: str, as_of_date: str) -> Decimal:
+    def cleared_balance_as_of(self, account_name: str, as_of_date: str, in_base: bool = False) -> Decimal:
         """
         The ledger's balance for an account considering ONLY transactions
         the user has marked reconciled, dated on or before as_of_date.
@@ -3894,6 +4422,10 @@ class GeneralLedger(PeriodLockMixin):
         reconciliation session -- distinct from running_balance_as_of(),
         which includes every transaction regardless of reconciled status
         and backs the separate, automated reconciliation_report() check.
+
+        Returned in the ACCOUNT'S OWN currency by default (that is what a
+        statement shows); pass in_base=True for the base-currency value.
+        Identical for base-currency accounts.
         """
         if account_name not in self.accounts:
             raise ValueError(f"Account '{account_name}' does not exist.")
@@ -3905,9 +4437,11 @@ class GeneralLedger(PeriodLockMixin):
                 continue
             for line in tx.lines:
                 if line.account_name == account_name:
-                    total_dr += line.dr
-                    total_cr += line.cr
+                    total_dr += line.dr if in_base else line.native_dr
+                    total_cr += line.cr if in_base else line.native_cr
         bal = total_dr - total_cr if acc.NORMAL_BALANCES[acc.account_type] == "DR" else total_cr - total_dr
+        if not in_base and acc.currency != self.base_currency:
+            return quantize_native(bal, acc.currency)
         return money(bal)
 
     def get_transactions_for_account(self, account_name: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> List[Transaction]:
@@ -3978,7 +4512,15 @@ class GeneralLedger(PeriodLockMixin):
         if balance is None:
             return False, "No balance provided."
 
-        m_balance = money(balance)
+        # A statement balance is in the account's own currency.
+        try:
+            acc_currency = self.accounts[account_name].currency
+            if acc_currency == self.base_currency:
+                m_balance = money(balance)
+            else:
+                m_balance = quantize_native(parse_decimal(balance, "balance"), acc_currency)
+        except (ValueError, InvalidOperation) as e:
+            return False, f"Invalid balance: {e}"
         conn, cur = self._connect()
         try:
             cur.execute(
@@ -4011,7 +4553,7 @@ class GeneralLedger(PeriodLockMixin):
         finally:
             conn.close()
         return [
-            {"id": r[0], "account_name": r[1], "date": r[2], "balance": money(r[3]), "source": r[4], "recorded_at": r[5]}
+            {"id": r[0], "account_name": r[1], "date": r[2], "balance": Decimal(r[3]), "source": r[4], "recorded_at": r[5]}
             for r in rows
         ]
 
@@ -4029,23 +4571,30 @@ class GeneralLedger(PeriodLockMixin):
             conn.close()
         return True, "Checkpoint deleted."
 
-    def running_balance_as_of(self, account_name: str, as_of_date: str) -> Decimal:
+    def running_balance_as_of(self, account_name: str, as_of_date: str, native: bool = False) -> Decimal:
         """
         The ledger's own computed balance for an account, using only
         entries dated on or before as_of_date. Assumes dates are stored
         as normalized YYYY-MM-DD strings (enforced by record_transaction),
         so lexicographic comparison is chronological.
+
+        Base-currency amounts by default (balance sheet, trial balance and
+        equity statement rely on that). native=True returns the balance in
+        the account's own currency, for comparing to statements.
         """
         if account_name not in self.accounts:
             raise ValueError(f"Account '{account_name}' does not exist.")
         acc = self.accounts[account_name]
+        dr_key, cr_key = ("ndr", "ncr") if native else ("dr", "cr")
         total_dr = ZERO
         total_cr = ZERO
         for entry in acc.entries:
             if entry["date"] <= as_of_date:
-                total_dr += entry["dr"]
-                total_cr += entry["cr"]
+                total_dr += entry[dr_key]
+                total_cr += entry[cr_key]
         bal = total_dr - total_cr if acc.NORMAL_BALANCES[acc.account_type] == "DR" else total_cr - total_dr
+        if native and acc.currency != self.base_currency:
+            return quantize_native(bal, acc.currency)
         return money(bal)
 
     def reconciliation_report(self, account_name: Optional[str] = None, tolerance: Optional[Decimal] = None) -> List[Dict[str, Any]]:
@@ -4053,26 +4602,34 @@ class GeneralLedger(PeriodLockMixin):
         Compare each recorded statement-balance checkpoint against the
         ledger's own running balance for that account as of the same
         date. One row per checkpoint; "matched" is True when the two
-        balances agree within `tolerance` (default one cent).
-        """
-        if tolerance is None:
-            tolerance = self.RECONCILIATION_TOLERANCE
+        balances agree within `tolerance`.
 
+        Comparison happens in the ACCOUNT'S OWN currency (statements are in
+        that currency), so exchange-rate movement never causes a false
+        mismatch. Default tolerance is one minor unit of that currency
+        (one cent for base-currency accounts).
+        """
         results = []
         for cp in self.get_statement_balances(account_name):
-            try:
-                ledger_balance = self.running_balance_as_of(cp["account_name"], cp["date"])
-            except ValueError:
+            acc = self.accounts.get(cp["account_name"])
+            if acc is None:
                 continue
-            difference = money(ledger_balance - cp["balance"])
+            foreign = acc.currency != self.base_currency
+            ledger_balance = self.running_balance_as_of(cp["account_name"], cp["date"], native=True)
+            tol = tolerance
+            if tol is None:
+                tol = minor_unit(acc.currency) if foreign else self.RECONCILIATION_TOLERANCE
+            raw_diff = ledger_balance - cp["balance"]
+            difference = quantize_native(raw_diff, acc.currency) if foreign else money(raw_diff)
             results.append(
                 {
                     "account_name": cp["account_name"],
+                    "currency": acc.currency,
                     "date": cp["date"],
                     "statement_balance": cp["balance"],
                     "ledger_balance": ledger_balance,
                     "difference": difference,
-                    "matched": abs(difference) <= tolerance,
+                    "matched": abs(difference) <= tol,
                     "source": cp["source"],
                 }
             )

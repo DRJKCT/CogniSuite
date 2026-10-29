@@ -20,7 +20,7 @@ from PyQt6.QtGui import QColor
 
 from ledger import GeneralLedger, MERCHANT_MEMORY_PROMOTE_THRESHOLD, MERCHANT_MEMORY_SUGGEST_THRESHOLD
 from pdf_import import PDFImportThread, normalize_statement_date
-from ofx_import import OFXImportThread, record_merchant_learning_for_last_transaction
+from ofx_import import OFXImportThread, record_merchant_learning_for_last_transaction, lines_with_fx
 from merchant_normalization import normalize_merchant
 
 logger = logging.getLogger(__name__)
@@ -760,7 +760,8 @@ class ImportManager(QObject):
             tx = next((t for t in self.gl.transactions if t.id == pending_id), None)
             if tx:
                 old_imp_id = tx.imported_id
-                existing_lines = [(l.id, l.account_name, l.dr, l.cr) for l in tx.lines]
+                # l.fx keeps a foreign-currency line's native amount and rate through the edit.
+                existing_lines = [(l.id, l.account_name, l.dr, l.cr, l.fx) for l in tx.lines]
                 ok, msg = self.gl.edit_transaction(pending_id, bank_date, bank_desc, existing_lines)
                 if ok:
                     new_tx = next((t for t in self.gl.transactions if t.imported_id == old_imp_id), None)
@@ -782,7 +783,7 @@ class ImportManager(QObject):
             if source == "pdf":
                 date_str = normalize_statement_date(date_str) or datetime.now().strftime("%Y-%m-%d")
             desc = tx.get("description", "")
-            lines = tx.get("lines", [])
+            lines = lines_with_fx(tx)
             imp_id = tx.get("imported_id")
             if not imp_id and source == "pdf":
                 amount = tx.get("amount", 0)

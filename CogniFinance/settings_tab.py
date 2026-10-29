@@ -1,7 +1,11 @@
 """
-settings_tab.py ver 1.0
+settings_tab.py ver 1.1
 For CogniFinance ver 0.9.3
 Encapsulates the Settings & Preferences tab UI.
+
+v1.1: the Currency control is the ledger's BASE currency (stored in the
+ledger DB, not ui_config.json). It can be changed only until the first
+transaction is recorded; after that it is shown read-only.
 """
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QGroupBox, QFormLayout,
@@ -15,11 +19,21 @@ from price_fetch_settings import PriceFetchSettingsGroup
 import ui_config
 import simple_mode
 
+# (ISO code, symbol). The ledger accepts any 3-letter code; this is the
+# list offered in the UI. A base currency already in the ledger that isn't
+# listed here is added to the combo automatically.
+BASE_CURRENCY_CHOICES = [
+    ("USD", "$"), ("CAD", "$"), ("EUR", "\u20ac"), ("GBP", "\u00a3"),
+    ("AUD", "$"), ("NZD", "$"), ("CHF", "CHF"), ("JPY", "\u00a5"),
+    ("MXN", "$"), ("INR", "\u20b9"),
+]
+
 
 class SettingsTab(QWidget):
     """Settings and preferences tab."""
     theme_changed = pyqtSignal(str)
     simple_mode_changed = pyqtSignal(bool)
+    base_currency_changed = pyqtSignal(str)  # ISO code, after the ledger accepted it
 
     def __init__(self, parent=None, gl=None):
         super().__init__(parent)
@@ -64,10 +78,17 @@ class SettingsTab(QWidget):
         self.date_format_combo.setCurrentText("YYYY-MM-DD")
         general_layout.addRow("Date Format:", self.date_format_combo)
 
+        # Base (reporting) currency. The ledger is the source of truth, so
+        # this is NOT saved to ui_config.json -- see _persisted_widgets().
         self.currency_combo = QComboBox()
-        self.currency_combo.addItems(["USD ($)", "CAD ($)", "EUR (€)", "GBP (£)"])
-        self.currency_combo.setCurrentText("CAD ($)")
-        general_layout.addRow("Currency:", self.currency_combo)
+        for code, symbol in BASE_CURRENCY_CHOICES:
+            self.currency_combo.addItem(self._currency_label(code, symbol), code)
+        general_layout.addRow("Base currency:", self.currency_combo)
+
+        self.currency_help = QLabel("")
+        self.currency_help.setWordWrap(True)
+        self.currency_help.setStyleSheet("color: #6B7280; font-size: 11px;")
+        general_layout.addRow(self.currency_help)
 
         layout.addWidget(general_group)
 
@@ -174,6 +195,7 @@ class SettingsTab(QWidget):
 
         layout.addStretch()
         self._load_settings()
+        self.refresh_currency()
 
     # ------------------------------------------------------------------
     # Persistence (ui_config.json -> "settings"). The theme is NOT stored
@@ -183,9 +205,9 @@ class SettingsTab(QWidget):
     _SECTION = "settings"
 
     def _persisted_widgets(self):
+        # The base currency lives in the ledger, not here.
         return {
             "date_format": self.date_format_combo,
-            "currency": self.currency_combo,
             "auto_lock": self.auto_lock_check,
             "lock_timeout": self.lock_timeout_combo,
             "require_passphrase_backup": self.require_passphrase_backup,
@@ -221,6 +243,8 @@ class SettingsTab(QWidget):
 
     def _save_settings(self):
         """Save settings and emit theme change signal."""
+        if not self._apply_base_currency():
+            return
         try:
             ui_config.update_section(self._SECTION, self._collect_settings())
         except Exception as e:
@@ -240,6 +264,88 @@ class SettingsTab(QWidget):
         QMessageBox.information(self, "Settings Saved",
             "Settings have been saved successfully.\n\n"
             "Note: Some settings may require restarting the application.")
+
+    # ------------------------------------------------------------------
+    # Base currency (ledger-backed)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _currency_label(code: str, symbol: str = "") -> str:
+        return f"{code} ({symbol})" if symbol else code
+
+    def _selected_currency_code(self) -> str:
+        code = self.currency_combo.currentData()
+        return code if isinstance(code, str) else self.currency_combo.currentText()[:3].upper()
+
+    def _ledger_has_transactions(self) -> bool:
+        return self.gl is not None and bool(getattr(self.gl, "transactions", None))
+
+    def refresh_currency(self):
+        """Re-read the base currency from the ledger and set the lock state.
+        Safe to call any time (BudgetApp can call it after imports/posting)."""
+        if self.gl is None:
+            self.currency_combo.setEnabled(False)
+            self.currency_help.setText("Open a ledger to set the base currency.")
+            return
+        code = self.gl.get_base_currency()
+        idx = self.currency_combo.findData(code)
+        if idx < 0:
+            self.currency_combo.addItem(self._currency_label(code), code)
+            idx = self.currency_combo.findData(code)
+        self.currency_combo.blockSignals(True)
+        self.currency_combo.setCurrentIndex(idx)
+        self.currency_combo.blockSignals(False)
+
+        locked = self._ledger_has_transactions()
+        self.currency_combo.setEnabled(not locked)
+        if locked:
+            self.currency_help.setText(
+                f"Your books are kept in {code}. The base currency is fixed once "
+                "the first transaction is recorded, because every recorded amount "
+                "is stored in it."
+            )
+            self.currency_combo.setToolTip("Can't be changed after transactions exist.")
+        else:
+            self.currency_help.setText(
+                "All reports and balances are shown in this currency. You can "
+                "change it until you record your first transaction."
+            )
+            self.currency_combo.setToolTip("")
+
+    def _apply_base_currency(self) -> bool:
+        """Push the chosen base currency into the ledger. Returns False if
+        the save should stop (user cancelled, or the ledger refused)."""
+        if self.gl is None or not self.currency_combo.isEnabled():
+            return True
+        code = self._selected_currency_code()
+        if code == self.gl.get_base_currency():
+            return True
+
+        answer = QMessageBox.question(
+            self, "Change Base Currency",
+            f"Set your base currency to {code}?\n\n"
+            "You can change this only until you record your first transaction. "
+            "After that it is permanent for this ledger.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self.refresh_currency()
+            return False
+
+        ok, msg = self.gl.set_base_currency(code)
+        if not ok:
+            QMessageBox.warning(self, "Base Currency Not Changed", msg)
+            self.refresh_currency()
+            return False
+        self.refresh_currency()
+        self.base_currency_changed.emit(code)
+        return True
+
+    def showEvent(self, event):
+        # Transactions may have been recorded since the tab was built.
+        self.refresh_currency()
+        super().showEvent(event)
 
     # ------------------------------------------------------------------
     # Simple Mode

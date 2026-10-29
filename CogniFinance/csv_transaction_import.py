@@ -93,13 +93,6 @@ class CSVImportError(ValueError):
     """Structural problem with the file itself -- unreadable, or
     missing a column the mapping says to expect. Distinct from a
     single bad row, which is skipped rather than raised."""
-    amount_col: Optional[str] = None
-    fee_col: Optional[str] = None
-    action_aliases: Dict[str, str] = field(default_factory=lambda: dict(DEFAULT_ACTION_ALIASES))
-    # Only used by "split" rows: one column holding the ratio as
-    # "2:1", "2-for-1", "2/1" or a bare "2" (meaning 2-for-1). Placed
-    # last so existing keyword/positional construction is unaffected.
-    ratio_col: Optional[str] = None
 
 
 @dataclass
@@ -119,6 +112,15 @@ class ColumnMapping:
     amount_col: Optional[str] = None
     fee_col: Optional[str] = None
     action_aliases: Dict[str, str] = field(default_factory=lambda: dict(DEFAULT_ACTION_ALIASES))
+    # Only used by "split" rows: one column holding the ratio as
+    # "2:1", "2-for-1", "2/1" or a bare "2" (meaning 2-for-1). Placed
+    # after the older fields so existing keyword/positional construction is unaffected.
+    ratio_col: Optional[str] = None
+    # Optional multi-currency columns. currency_col: a 3-letter code (USD, EUR...)
+    # naming the currency the row's price/amount/fee are in. fx_rate_col: base
+    # units per 1 unit of that currency, if the file records the rate it used.
+    currency_col: Optional[str] = None
+    fx_rate_col: Optional[str] = None
 
 
 @dataclass
@@ -136,6 +138,11 @@ class ParsedTransactionRow:
     amount: Optional[Decimal] = None  # drip: total dividend reinvested; other rows: raw amount column if mapped
     split_new: Optional[Decimal] = None  # split only: new shares ...
     split_old: Optional[Decimal] = None  # ... for this many old shares
+    # Multi-currency (None = not given; the poster decides what that means,
+    # normally "the cash account's currency"). fx_rate is base units per 1
+    # unit of `currency` and is only meaningful together with it.
+    currency: Optional[str] = None
+    fx_rate: Optional[Decimal] = None
 
 
 @dataclass
@@ -169,13 +176,15 @@ def _normalize_date(raw: str) -> Optional[str]:
 def _decimal_or_none(raw: Optional[str]) -> Optional[Decimal]:
     if raw is None:
         return None
-    raw = raw.strip().replace(",", "").replace("$", "")
+    raw = re.sub(r"[$\u20ac\u00a3\u00a5]", "", raw.strip().replace(",", ""))
     if not raw:
         return None
     try:
         return Decimal(raw)
     except InvalidOperation:
         return None
+
+_CCY_RE = re.compile(r"^[A-Z]{3}$")
 
 _SPLIT_RATIO_RE = re.compile(
     r"^\s*(\d+(?:\.\d+)?)\s*(?:[:/]|-?for-?)\s*(\d+(?:\.\d+)?)\s*$", re.IGNORECASE
@@ -255,6 +264,23 @@ def parse_transaction_csv(path: str, mapping: ColumnMapping) -> ParseResult:
                 fee = _decimal_or_none(row.get(mapping.fee_col)) if mapping.fee_col else None
                 fee = fee if fee is not None else Decimal("0.00")
 
+                currency = None
+                if mapping.currency_col:
+                    ccy_raw = (row.get(mapping.currency_col) or "").strip().upper()
+                    if ccy_raw:
+                        if not _CCY_RE.match(ccy_raw):
+                            skipped.append((i, f"unrecognized currency '{ccy_raw}' (expected a 3-letter code such as USD)"))
+                            continue
+                        currency = ccy_raw
+                fx_rate = None
+                if mapping.fx_rate_col:
+                    rate_raw = (row.get(mapping.fx_rate_col) or "").strip()
+                    if rate_raw:
+                        fx_rate = _decimal_or_none(rate_raw)
+                        if fx_rate is None or fx_rate <= 0:
+                            skipped.append((i, f"invalid exchange rate '{rate_raw}'"))
+                            continue
+
                 raw_amount = _decimal_or_none(row.get(mapping.amount_col)) if mapping.amount_col else None
                 if price is None and raw_amount is not None and quantity:
                     if quantity != 0:
@@ -319,6 +345,7 @@ def parse_transaction_csv(path: str, mapping: ColumnMapping) -> ParseResult:
                     row_number=i, date=date_str, symbol=symbol, action=action,
                     quantity=quantity, price=price, fee=fee, raw=dict(row),
                     amount=row_amount, split_new=split_new, split_old=split_old,
+                    currency=currency, fx_rate=fx_rate,
                 ))
     except FileNotFoundError:
         raise CSVImportError(f"File not found: '{path}'")
@@ -326,6 +353,13 @@ def parse_transaction_csv(path: str, mapping: ColumnMapping) -> ParseResult:
     return ParseResult(rows=rows, skipped=skipped)
 
 
+# Multi-currency note for poster authors: row.currency (when the file has
+# one) names the currency of the row's price/amount/fee. The engines take
+# those amounts in the CASH ACCOUNT's currency, so the poster should pick the
+# cash account whose currency matches row.currency, and pass row.fx_rate
+# (fx_rate=) only when the two agree -- a rate quoted for one currency must
+# never be applied to another.
+#
 # A poster takes one parsed row and attempts to apply it (e.g. calling
 # investment_engine.buy(...) or crypto_engine.transfer(...) with
 # whatever fixed context -- cash account, wallet, default report line
@@ -359,7 +393,7 @@ class CSVColumnMappingDialog(QDialog):
         layout.addWidget(QLabel(f"Detected header row:\n{header_line}"))
         layout.addWidget(QLabel(
             "Enter the exact column names from your file for each field below. "
-            "Leave Quantity/Price/Amount/Fee/Split ratio blank if your file doesn't have that column."
+            "Leave Quantity/Price/Amount/Fee/Split ratio/Currency/Exchange rate blank if your file doesn't have that column."
         ))
 
         form = QFormLayout()
@@ -371,6 +405,8 @@ class CSVColumnMappingDialog(QDialog):
         self.amount_col = QLineEdit("")
         self.fee_col = QLineEdit("Fee")
         self.ratio_col = QLineEdit("")
+        self.currency_col = QLineEdit("")
+        self.fx_rate_col = QLineEdit("")
         form.addRow("Date column:", self.date_col)
         form.addRow("Symbol column:", self.symbol_col)
         form.addRow("Action/Type column:", self.action_col)
@@ -379,6 +415,8 @@ class CSVColumnMappingDialog(QDialog):
         form.addRow("Total amount column (if no per-unit price):", self.amount_col)
         form.addRow("Fee column:", self.fee_col)
         form.addRow("Split ratio column (splits only, e.g. 2:1):", self.ratio_col)
+        form.addRow("Currency column (e.g. USD; optional):", self.currency_col)
+        form.addRow("Exchange rate column (to your base currency; optional):", self.fx_rate_col)
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -397,6 +435,8 @@ class CSVColumnMappingDialog(QDialog):
             amount_col=self.amount_col.text().strip() or None,
             fee_col=self.fee_col.text().strip() or None,
             ratio_col=self.ratio_col.text().strip() or None,
+            currency_col=self.currency_col.text().strip() or None,
+            fx_rate_col=self.fx_rate_col.text().strip() or None,
         )
         # Fail fast on a structurally bad mapping (missing required
         # column) rather than letting the background thread discover

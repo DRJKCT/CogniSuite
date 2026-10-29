@@ -6,6 +6,7 @@ from ofxparse import OfxParser
 from reconciliation_matcher import extract_suggested_matches
 from merchant_normalization import normalize_merchant
 from PyQt6.QtCore import QThread, pyqtSignal
+from currency import normalize_currency
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,12 @@ def inspect_ofx_account(file_path: str) -> Dict[str, Any]:
         is_asset = raw_type in asset_types
 
     statement = getattr(account, 'statement', None)
+    # The statement's currency (OFX CURDEF). None when the file doesn't say.
+    raw_ccy = str(getattr(account, 'curdef', '') or getattr(statement, 'currency', '') or '').strip()
+    try:
+        currency = normalize_currency(raw_ccy) if raw_ccy else None
+    except ValueError:
+        currency = None
     bank_name = getattr(statement, 'institution', None) or "Unknown Bank"
     raw_acc_id = str(getattr(account, 'account_id', '0000') or "0000")
     clean_acc_id = raw_acc_id.strip()
@@ -47,7 +54,8 @@ def inspect_ofx_account(file_path: str) -> Dict[str, Any]:
         "bank_name": bank_name,
         "suggested_name": suggested_name,
         "is_asset": is_asset,
-        "detected_type": "Asset" if is_asset else "Liability"
+        "detected_type": "Asset" if is_asset else "Liability",
+        "currency": currency,
     }
 
 def parse_ofx_to_ledger_transactions(
@@ -69,9 +77,17 @@ def parse_ofx_to_ledger_transactions(
     is_asset = account_info["is_asset"]
 
     new_accounts = []
+    ofx_currency = account_info.get("currency")
     if target_account_name not in ledger.accounts:
-        ledger.create_account(target_account_name, account_info["detected_type"])
+        # A statement in a non-base currency creates a foreign-currency account.
+        ledger.create_account(target_account_name, account_info["detected_type"], currency=ofx_currency)
         new_accounts.append((target_account_name, account_info["detected_type"]))
+    elif ofx_currency and ofx_currency != ledger.accounts[target_account_name].currency:
+        raise ValueError(
+            f"'{os.path.basename(file_path)}' is a {ofx_currency} statement, but account "
+            f"'{target_account_name}' is in {ledger.accounts[target_account_name].currency}. "
+            "Importing would post the wrong currency; rename or recreate the account."
+        )
 
     txns = import_ofx_transactions(
         file_path=file_path,
@@ -120,6 +136,13 @@ def import_ofx_transactions(
 
     transactions_to_import = []
 
+    # Statement amounts are in the account's own currency. For a foreign
+    # account each one is converted to base at its transaction date's rate,
+    # and the native amount + rate ride along in tx["fx"] (see lines_with_fx).
+    target_acc = ledger.accounts.get(target_account_name)
+    foreign = target_acc is not None and target_acc.currency != ledger.base_currency
+    rate_errors: Dict[str, str] = {}
+
     for txn in statement.transactions:
         date_str = txn.date.strftime("%Y-%m-%d")
 
@@ -144,6 +167,14 @@ def import_ofx_transactions(
             raw_amount = -raw_amount
 
         abs_amount = abs(raw_amount)
+        fx_map: Dict[str, Any] = {}
+        if foreign:
+            try:
+                abs_amount, target_fx = ledger.convert_to_base(target_account_name, abs_amount, date_str)
+            except ValueError as e:
+                rate_errors.setdefault(date_str, str(e))
+                continue
+            fx_map[target_account_name] = target_fx
         rule_category = ledger.apply_category_rules(description)
         lines_data = []
 
@@ -178,11 +209,19 @@ def import_ofx_transactions(
             "date": date_str,
             "description": description,
             "lines": lines_data,
+            "fx": fx_map,
             "imported_id": fitid,
             "merchant_key": merchant_key,
             "merchant_display": merchant_display,
             "category_suggested": category_suggested,
         })
+
+    if rate_errors:
+        first = sorted(rate_errors)[0]
+        raise ValueError(
+            f"Can't import '{target_account_name}': {len(rate_errors)} date(s) have no exchange rate "
+            f"(first: {first}). {rate_errors[first]} Nothing was imported."
+        )
 
     ending_bal = getattr(statement, 'balance', None)
     starting_bal = getattr(statement, 'start_balance', None)
@@ -193,6 +232,11 @@ def import_ofx_transactions(
         for t in transactions_to_import:
             for acc, debit, credit in t["lines"]:
                 if acc == target_account_name:
+                    # The statement is in the account's own currency, so compare native amounts.
+                    fx = (t.get("fx") or {}).get(acc)
+                    if fx is not None:
+                        debit = fx.native if debit > 0 else Decimal("0.00")
+                        credit = fx.native if credit > 0 else Decimal("0.00")
                     actual_mapped_delta += (debit - credit) if is_asset else (credit - debit)
 
         if actual_mapped_delta != expected_delta:
@@ -203,6 +247,19 @@ def import_ofx_transactions(
             )
 
     return transactions_to_import
+
+def lines_with_fx(tx: Dict[str, Any]) -> list:
+    """The ledger-ready lines for a parsed import dict. Lines stay plain
+    (account, dr, cr) base-currency tuples in tx["lines"] -- so existing
+    consumers such as reconciliation_matcher are unaffected -- and any
+    foreign-currency detail sits in tx["fx"] ({account_name: FxInfo}).
+    This attaches it for posting. A dict with no "fx" returns its lines as-is."""
+    lines = tx.get("lines") or []
+    fx_map = tx.get("fx") or {}
+    if not fx_map:
+        return lines
+    return [(acc, dr, cr, fx_map.get(acc)) for acc, dr, cr in lines]
+
 
 def record_merchant_learning_for_last_transaction(ledger, description: str, merchant_key: str = None,
                                                    merchant_display: str = None, category_suggested=None,
@@ -303,7 +360,7 @@ class OFXImportThread(QThread):
                         ok, msg = self.gl.record_transaction(
                             date=tx["date"],
                             description=tx["description"],
-                            lines_data=tx["lines"],
+                            lines_data=lines_with_fx(tx),
                             imported_id=tx["imported_id"],
                             persist=True
                         )
