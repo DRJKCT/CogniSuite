@@ -1,6 +1,6 @@
 """
 simple_theme.py ver 0.1
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 
 The look shared by the Simple Mode screens (Home, Money, ...): two
 palettes, one stylesheet, and the one place money becomes text.

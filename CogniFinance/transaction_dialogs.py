@@ -1,6 +1,6 @@
 """
 transaction_dialogs.py ver 1.0
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 Encapsulates the Add and Edit transaction dialogs, including the
 NumericDelegate and dynamic line-table management.
 """

@@ -58,7 +58,9 @@ from reconcile_tab import ReconcileTab
 from config import NOTIFICATIONS_PATH, BACKUP_DIR, UI_CONFIG_PATH
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from settings_tab import SettingsTab
+from settings_tab import SettingsTab, BASE_CURRENCY_CHOICES
+from currency import currency_decimals, normalize_currency
+from html import escape as _html_escape
 from recurring_tab import RecurringTab
 import simple_mode
 import shell_config
@@ -183,6 +185,16 @@ def _save_window_geometry(width: int, height: int) -> None:
     except Exception:
         # Best-effort — should not block shutdown
         pass
+
+# Account types that can hold a foreign currency. Categories (Expense/Revenue)
+# and Equity are always kept in the base currency.
+CURRENCY_CAPABLE_TYPES = ("Asset", "Liability")
+
+
+def format_money(amount, code: str) -> str:
+    """'1,234.50 USD' using the currency's own number of decimals."""
+    return f"{amount:,.{currency_decimals(code)}f} {code}"
+
 
 class ShrinkableStack(QStackedWidget):
     def minimumSizeHint(self):
@@ -381,7 +393,7 @@ class CollapsibleSidebar(QWidget):
             self.nav_layout.insertWidget(i, btn)
 
         # Footer with version
-        self.footer_label = QLabel("v0.9.3")
+        self.footer_label = QLabel("v0.9.67")
         self.footer_label.setStyleSheet("color: #999; padding: 10px; font-size: 11px;")
         self.footer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.footer_label)
@@ -786,6 +798,7 @@ class BudgetApp(QMainWindow):
         self.tab_budgets.data_modified.connect(self.refresh_overview)
         self.tab_investments.data_modified.connect(self._refresh_all_data)
         self.tab_settings.simple_mode_changed.connect(self._apply_simple_mode)
+        self.tab_settings.base_currency_changed.connect(self._on_base_currency_changed)
         if hasattr(self.tab_settings, 'show_reconcile_check'):
             self.tab_settings.show_reconcile_check.toggled.connect(self._apply_sidebar_for_mode)
 
@@ -1170,6 +1183,7 @@ class BudgetApp(QMainWindow):
         self.accounts_table.setColumnCount(2)
         self.accounts_table.setHorizontalHeaderLabels(["Account Name", "Type"])
         setup_table_headers(self.accounts_table, [0.7, 0.3])
+        self._accounts_table_wide = False   # True once the Currency/Balance columns are showing
         box_layout.addWidget(self.accounts_table)
 
         btn_row = QHBoxLayout()
@@ -1191,10 +1205,77 @@ class BudgetApp(QMainWindow):
         self.refresh_accounts_table()
 
     def refresh_accounts_table(self):
+        base = self.gl.base_currency
+        has_foreign = any(a.currency != base for a in self.gl.accounts.values())
+
+        # The table stays exactly as it was for a base-currency-only ledger.
+        # Currency and balance columns appear only once a foreign account exists.
+        if has_foreign != self._accounts_table_wide:
+            self._accounts_table_wide = has_foreign
+            if has_foreign:
+                self.accounts_table.setColumnCount(4)
+                self.accounts_table.setHorizontalHeaderLabels(
+                    ["Account Name", "Type", "Currency", "Balance (account currency)"])
+                setup_table_headers(self.accounts_table, [0.38, 0.14, 0.14, 0.34])
+            else:
+                self.accounts_table.setColumnCount(2)
+                self.accounts_table.setHorizontalHeaderLabels(["Account Name", "Type"])
+                setup_table_headers(self.accounts_table, [0.7, 0.3])
+
         self.accounts_table.setRowCount(len(self.gl.accounts))
         for row, (name, acc) in enumerate(sorted(self.gl.accounts.items())):
             self.accounts_table.setItem(row, 0, QTableWidgetItem(name))
             self.accounts_table.setItem(row, 1, QTableWidgetItem(acc.account_type))
+            if not has_foreign:
+                continue
+            self.accounts_table.setItem(row, 2, QTableWidgetItem(acc.currency))
+            foreign = acc.currency != base
+            native = acc.get_native_balance() if foreign else acc.get_balance()
+            bal_item = QTableWidgetItem(format_money(native, acc.currency))
+            bal_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            if foreign:
+                bal_item.setToolTip(
+                    f"Carried in your books at {format_money(acc.get_balance(), base)}, "
+                    "using the exchange rate recorded on each transaction (no revaluation)."
+                )
+            self.accounts_table.setItem(row, 3, bal_item)
+
+    def refresh_account_combos(self):
+        """Refresh the account dropdowns of the other tabs after the chart of accounts changes."""
+        for tab_name in ("tab_transactions", "tab_transactions2", "tab_budgets"):
+            tab = getattr(self, tab_name, None)
+            if tab is not None and hasattr(tab, "refresh_account_dropdown"):
+                tab.refresh_account_dropdown()
+        if hasattr(self, "tab_rules") and hasattr(self.tab_rules, "_populate_category_combo"):
+            self.tab_rules._populate_category_combo()
+
+    def _currency_picker(self, current: Optional[str] = None) -> QComboBox:
+        """Editable currency chooser: base first, then the common list, then any
+        other currency already used by an account. Typed codes are validated by the ledger."""
+        combo = QComboBox()
+        combo.setEditable(True)
+        codes = [self.gl.base_currency] + [c for c, _ in BASE_CURRENCY_CHOICES]
+        codes += [a.currency for a in self.gl.accounts.values()]
+        seen = set()
+        for code in codes:
+            if code not in seen:
+                seen.add(code)
+                combo.addItem(code)
+        combo.setCurrentText(current or self.gl.base_currency)
+        combo.lineEdit().setMaxLength(3)
+        return combo
+
+    def _currency_from_picker(self, combo: QComboBox, type_name: str) -> str:
+        """The chosen code, or the base currency when the type can't be foreign."""
+        if type_name not in CURRENCY_CAPABLE_TYPES:
+            return self.gl.base_currency
+        return combo.currentText().strip().upper() or self.gl.base_currency
+
+    def _on_base_currency_changed(self, _code: str):
+        self.refresh_accounts_table()
+        self.refresh_account_combos()
+        self.refresh_overview()
+        self.refresh_balance_sheet()
 
     def add_new_account(self):
         dialog = QDialog(self)
@@ -1208,8 +1289,26 @@ class BudgetApp(QMainWindow):
             type_combo.addItem(t)
         type_combo.setCurrentText("Expense")
 
+        currency_combo = self._currency_picker()
+        currency_help = QLabel(
+            f"Leave as {self.gl.base_currency} unless this account is held in another currency "
+            "(for example a US dollar bank account). It can't be changed after transactions are recorded."
+        )
+        currency_help.setWordWrap(True)
+        currency_help.setStyleSheet("color: #6B7280; font-size: 11px;")
+
+        def _sync_currency_enabled(type_name: str):
+            allowed = type_name in CURRENCY_CAPABLE_TYPES
+            currency_combo.setEnabled(allowed)
+            if not allowed:
+                currency_combo.setCurrentText(self.gl.base_currency)
+        type_combo.currentTextChanged.connect(_sync_currency_enabled)
+        _sync_currency_enabled(type_combo.currentText())
+
         form.addRow("Account Name:", name_edit)
         form.addRow("Account Type:", type_combo)
+        form.addRow("Currency:", currency_combo)
+        form.addRow(currency_help)
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -1223,7 +1322,12 @@ class BudgetApp(QMainWindow):
             if not name:
                 QMessageBox.warning(self, "Error", "Account name cannot be empty.")
                 return
-            ok, msg = self.gl.create_account(name, acc_type)
+            try:
+                currency = normalize_currency(self._currency_from_picker(currency_combo, acc_type))
+            except ValueError as e:
+                QMessageBox.warning(self, "Error", str(e))
+                return
+            ok, msg = self.gl.create_account(name, acc_type, currency=currency)
             if ok:
                 self.refresh_accounts_table()
                 self.refresh_account_combos()
@@ -1267,8 +1371,24 @@ class BudgetApp(QMainWindow):
             type_combo.addItem(t)
         type_combo.setCurrentText(acc.account_type)
 
+        # Currency is fixed once an account has transactions (their amounts
+        # are already stored in it), so it is read-only from then on.
+        currency_locked = bool(acc.entries)
+        currency_combo = self._currency_picker(acc.currency)
+
+        def _sync_currency_enabled(type_name: str):
+            allowed = (not currency_locked) and type_name in CURRENCY_CAPABLE_TYPES
+            currency_combo.setEnabled(allowed)
+            if not currency_locked and not allowed:
+                currency_combo.setCurrentText(self.gl.base_currency)
+        type_combo.currentTextChanged.connect(_sync_currency_enabled)
+        _sync_currency_enabled(type_combo.currentText())
+        if currency_locked:
+            currency_combo.setToolTip("Can't be changed after transactions exist.")
+
         form.addRow("Account Name:", name_edit)
         form.addRow("Account Type:", type_combo)
+        form.addRow("Currency:", currency_combo)
         layout.addLayout(form)
 
         warning = QLabel("<b>Note:</b> Changing the name will automatically update all historical transactions, budgets, and rules associated with this account.")
@@ -1290,6 +1410,12 @@ class BudgetApp(QMainWindow):
                 return
 
             ok, msg = self.gl.update_account(old_name, new_name, new_type)
+            if ok and not currency_locked:
+                new_currency = self._currency_from_picker(currency_combo, new_type)
+                if new_currency != acc.currency:
+                    ok_c, msg_c = self.gl.set_account_currency(new_name, new_currency)
+                    if not ok_c:
+                        QMessageBox.warning(self, "Currency Not Changed", msg_c)
             if ok:
                 self.refresh_accounts_table()
                 self.refresh_account_combos()
@@ -1462,7 +1588,31 @@ class BudgetApp(QMainWindow):
             """
             html = dark_css + html
 
+        html += self._foreign_accounts_html()
         self.balance_text.setHtml(html)
+
+    def _foreign_accounts_html(self) -> str:
+        """Native balance and carrying value of every foreign-currency account.
+        Empty (so the balance sheet is unchanged) when there are none."""
+        base = self.gl.base_currency
+        foreign = [(n, a) for n, a in sorted(self.gl.accounts.items()) if a.currency != base]
+        if not foreign:
+            return ""
+        rows = "".join(
+            f"<tr><td>{_html_escape(name)}</td><td>{acc.currency}</td>"
+            f"<td align='right'>{format_money(acc.get_native_balance(), acc.currency)}</td>"
+            f"<td align='right'>{format_money(acc.get_balance(), base)}</td></tr>"
+            for name, acc in foreign
+        )
+        return (
+            f"<h3>Foreign-currency accounts</h3>"
+            f"<table cellpadding='4' width='100%'>"
+            f"<tr><th align='left'>Account</th><th align='left'>Currency</th>"
+            f"<th align='right'>Balance</th><th align='right'>Carried at ({base})</th></tr>"
+            f"{rows}</table>"
+            f"<p><i>Amounts above are shown in {base} at the exchange rate recorded on each "
+            f"transaction. They are not revalued to today's rates.</i></p>"
+        )
 
     def update_status_bar(self, percent: int, message: str):
         self.statusBar().showMessage(message)

@@ -1,7 +1,7 @@
 # tax_parser.py
 """
 tax_parser.py ver 5.0
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 
 Template loader/validator. ver 5.0 (template format 5) adds:
   * a levy's `applies_to` may name a computed reference -- "total_income",

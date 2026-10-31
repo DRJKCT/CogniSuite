@@ -1,6 +1,6 @@
 """
 config.py ver 1.0
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 Centralized path configuration and atomic secure file I/O.
 
 Directory layout:

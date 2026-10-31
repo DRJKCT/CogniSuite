@@ -1,6 +1,6 @@
 """
 crypto_utils.py ver.0.1
-For CogniFinance ver 1.8
+For CogniFinance ver 0.9.67
 """
 
 from cryptography.fernet import Fernet, InvalidToken

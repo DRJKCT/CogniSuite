@@ -1,6 +1,6 @@
 """
 supply_chain_auditor.py ver 1.0
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 Runs pip-audit in a background QProcess to check for known CVEs
 in the project's dependencies.
 """

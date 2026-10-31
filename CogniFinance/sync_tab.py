@@ -1,7 +1,7 @@
 # sync_tab.py
 """
 sync_tab.py ver 1.0
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 Encapsulates the Mobile Sync tab UI, server lifecycle, QR rendering,
 and post-sync data processing.
 """

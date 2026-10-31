@@ -1,7 +1,7 @@
 # period_lock.py
 """
 period_lock.py ver 1.1
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 
 Per-account period locking. Finishing a reconciliation locks the account
 "through" the statement end date; any transaction that touches a locked

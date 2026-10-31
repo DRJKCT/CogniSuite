@@ -1,6 +1,6 @@
 """
 shell_config.py ver 0.1
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 
 Which sidebar entries each mode shows, and where they go.
 

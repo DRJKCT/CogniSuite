@@ -1,5 +1,5 @@
 # TestRunnerManager.py ver 0.2
-# CogniFinance ver 1.95
+# CogniFinance ver 0.9.67
 
 import sys
 import os

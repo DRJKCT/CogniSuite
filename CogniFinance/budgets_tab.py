@@ -1,7 +1,7 @@
 # budgets_tab.py
 """
 budgets_tab.py ver 2.0
-For CogniFinance ver 1.95
+For CogniFinance ver 0.9.67
 Envelope-based budgeting UI. Drives the ledger's ZBB/envelope engine
 (assign/unassign/move + income plan + rollover policies) and the
 rollover math in budget_engine.py.

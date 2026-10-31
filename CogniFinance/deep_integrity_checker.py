@@ -1,5 +1,5 @@
 # deep_integrity_checker.py ver 0.2
-# For CogniFinance ver 1.95
+# For CogniFinance ver 0.9.67
 
 import os
 import sys

@@ -1,6 +1,6 @@
 """
 plans_dialogs.py ver 0.1
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 
 The write side of the Plans screen. Each dialog says what it will do
 before the click and calls the same GeneralLedger method Pro Mode uses:

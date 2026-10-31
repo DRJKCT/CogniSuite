@@ -1,7 +1,7 @@
 """
 CogniSync desktop HTTP server.
 Version 1.1
-For CogniFinance ver 1.95
+For CogniFinance ver 0.9.67
 
 Ephemeral LAN server that receives encrypted transaction batches from the
 Android companion app (MainActivity_dynamic_MN_timestamp_updated.kt) over the

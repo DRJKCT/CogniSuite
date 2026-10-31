@@ -1,6 +1,6 @@
 """
 simple_inputs.py ver 0.1
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 
 Input parsing shared by the Simple Mode forms.
 """

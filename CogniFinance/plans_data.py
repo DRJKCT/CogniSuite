@@ -1,6 +1,6 @@
 """
 plans_data.py ver 0.1
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 
 The small decisions behind the Simple Mode Plans screen, kept out of the
 widgets so they can be tested: which month is showing, which accounts an

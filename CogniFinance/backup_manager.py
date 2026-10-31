@@ -1,6 +1,6 @@
 """
 backup_manager.py ver 1.0
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 Handles the core logic for manual external backups, restore operations,
 and backup health tracking. Completely isolated from the UI layer.
 """

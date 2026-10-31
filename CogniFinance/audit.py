@@ -7,7 +7,7 @@ sql_transaction_history table. It opens its own SQLCipher connections
 using the same passphrase as the main ledger, so it doesn't need to
 share state with the GeneralLedger instance.
 audit.py ver 0.2
-For CogniFinance ver 1.95
+For CogniFinance ver 0.9.67
 """
 import json
 from typing import List, Dict, Any, Optional

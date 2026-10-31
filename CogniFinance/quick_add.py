@@ -1,6 +1,6 @@
 """
 quick_add.py ver 0.1
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 
 The quick-add form used by both Simple Mode Home and Money, so there is
 one implementation of "add a transaction the easy way".

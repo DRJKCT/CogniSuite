@@ -1,7 +1,7 @@
 # reconcile_tab.py
 """
 reconcile_tab.py ver 1.1
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 Encapsulates the Reconciliation tab UI, including the unreconciled
 transaction tree view and the reconciliation marking logic.
 ver 1.1: Finish Reconciliation now locks the account through the statement

@@ -1,5 +1,5 @@
 # simple_reports_tab.py ver 0.2
-# For CogniFinance ver 1.9
+# For CogniFinance ver 0.9.67
 # Simple Mode Reports screen: statements + charts in one place.
 # Same builders, same ChartFactory, same export functions as Pro.
 # Everything is read-only here — no ledger writes.

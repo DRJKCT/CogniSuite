@@ -1,6 +1,6 @@
 """
 notification_center.py ver 0.1
-For CogniFinance ver 1.8
+For CogniFinance ver 0.9.67
 
 Notification backend: persisted state + the read/resolved distinction.
 

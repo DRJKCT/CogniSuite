@@ -1,7 +1,7 @@
 # tax_format.py
 """
 tax_format.py ver 1.0
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 
 Currency and rounding helpers shared by the tax calculator and the UI.
 Pure Python (no Qt): the UI passes in its locale's separators.

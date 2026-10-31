@@ -1,6 +1,6 @@
 """
 reconciliation_matcher.py ver 0.1
-For CogniFinance ver 1.8
+For CogniFinance ver 0.9.67
 
 Fuzzy-matches a pending transaction (e.g. mobile-synced, unreconciled)
 against a set of candidate transactions (e.g. freshly-parsed bank

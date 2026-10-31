@@ -1,7 +1,7 @@
 # html_renderers.py
 """
 html_renderers.py ver 1.0
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 Pure functions for generating HTML reports.
 Depends ONLY on standard Python types (dicts, lists, Decimals) and html.escape.
 Has ZERO dependency on PyQt6 or GeneralLedger.

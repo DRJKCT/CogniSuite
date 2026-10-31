@@ -1,6 +1,6 @@
 """
 simple_plans_tab.py ver 0.3
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 
 Simple Mode's Plans screen: this month's envelopes, and the one place in
 Simple Mode where the budget is changed (Home only reads it).

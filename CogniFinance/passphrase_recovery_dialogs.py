@@ -1,6 +1,6 @@
 """
 passphrase_recovery_dialogs.py ver 0.1
-For CogniFinance ver 1.8
+For CogniFinance ver 0.9.67
 Qt dialogs for the passphrase-hardening/recovery-key feature. Kept
 separate from passphrase_recovery.py so that module's pure logic
 (strength checking, escrow encode/decode) stays importable and testable

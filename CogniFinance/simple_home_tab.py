@@ -1,6 +1,6 @@
 """
 simple_home_tab.py ver 0.1
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 
 Simple Mode's Home screen: where do I stand, what happened lately, and
 a quick way to add something.

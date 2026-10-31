@@ -1,6 +1,6 @@
 """
 add_edit_tab.py ver 1.3
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 Encapsulates the Add/Edit tab UI.
 Features side-by-side forms and a vertical splitter for maximum data display.
 """

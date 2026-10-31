@@ -1,7 +1,7 @@
 # tax_calculator.py
 """
 tax_calculator.py ver 3.0
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 
 ver 4.0 vocabulary (all declared by templates, none country-specific):
   * `threshold_rates` adjustments: sum / min / max of "rate x amount over a

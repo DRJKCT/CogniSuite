@@ -1,6 +1,6 @@
 """
 pareser_integration.py ver 0.2
-For CogniFinance ver 1.8
+For CogniFinance ver 0.9.67
 """
 
 import os
@@ -73,6 +73,12 @@ def detect_bank_from_text(text: str) -> Optional[str]:
     if "tangerine" in t or "tangerine bank" in t:
         return "tangerine"
     return None
+
+
+# Every parser in this module (CIBC, Tangerine) reads Canadian-dollar statements. Each
+# parsed entry carries this so the importer can refuse to post CAD amounts into an
+# account of a different currency. Add a per-parser value if a non-CAD parser is added.
+STATEMENT_CURRENCY = "CAD"
 
 
 def clean_amount(val: str) -> Optional[float]:
@@ -571,6 +577,7 @@ def raw_rows_to_import_lines(raw: List[Dict[str, Any]], ledger: "GeneralLedger")
                 "amount": amount,
                 "direction": direction,
                 "lines": posting_lines,
+                "statement_currency": STATEMENT_CURRENCY,
                 "statement_balance": r.get("balance"),
                 "balance_check": r.get("balance_check"),
                 "balance_check_detail": r.get("balance_check_detail"),

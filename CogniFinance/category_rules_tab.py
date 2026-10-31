@@ -1,6 +1,6 @@
 """
 category_rules_tab.py ver 0.1
-For CogniFinance ver 1.8
+For CogniFinance ver 0.9.67
 Dedicated widget for managing category rules.
 """
 from typing import Optional

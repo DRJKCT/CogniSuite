@@ -1,6 +1,6 @@
 """
 simple_money_tab.py ver 0.1
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 
 Simple Mode's Money screen. One place for what Pro splits across the
 Add/Edit and Transactions tabs: add something, find something, fix or

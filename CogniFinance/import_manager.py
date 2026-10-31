@@ -1,7 +1,7 @@
 # import_manager.py
 """
 import_manager.py ver 1.0
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 Encapsulates all import/export logic, background thread management,
 progress dialogs, and the Suggested Matches review UI.
 """

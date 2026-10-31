@@ -1,6 +1,6 @@
 """
 money_data.py ver 0.1
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 
 Everything the Simple Mode Money screen lists, as plain data.
 

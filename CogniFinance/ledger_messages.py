@@ -1,6 +1,6 @@
 """
 ledger_messages.py ver 0.1
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 
 The ledger's refusal messages are written for Pro Mode ("Reopen the
 period on the Reconciliation tab"). Simple Mode hides that tab, so the

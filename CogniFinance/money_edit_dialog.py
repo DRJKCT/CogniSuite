@@ -1,6 +1,6 @@
 """
 money_edit_dialog.py ver 0.1
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 
 One transaction, opened from the Money screen.
 

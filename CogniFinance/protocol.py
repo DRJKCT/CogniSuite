@@ -1,5 +1,5 @@
 # protocol.py ver 0,3
-# For CogniFinance ver 1.95
+# For CogniFinance ver 0.9.67
 
 from __future__ import annotations
 import base64, hashlib, hmac, json, os, re, secrets, time, uuid

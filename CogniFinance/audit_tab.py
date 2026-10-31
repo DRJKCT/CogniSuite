@@ -5,7 +5,7 @@ Standalone QWidget that uses AuditLogReader for data access. Designed
 to be dropped into the main tab widget with minimal wiring in ui_main.py.
 
 audit_tab.py ver 0.2
-for CogniFinance ver 1.9
+for CogniFinance ver 0.9.67
 
 Tables here are *display surfaces*: they render state, they never accept
 in-place edits. Mutations in CogniFinance happen via actions (buttons,
