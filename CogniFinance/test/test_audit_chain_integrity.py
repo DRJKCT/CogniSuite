@@ -1,6 +1,6 @@
 """
 test_audit_chain_integrity.py
-For CogniFinance ver 1.9
+For CogniFinance ver 0.9.67
 Runs exclusively during the QUARTERLY deep integrity check.
 Verifies that the cryptographic hash chain of the audit trail has not been
 tampered with via raw SQL or external database manipulation.
